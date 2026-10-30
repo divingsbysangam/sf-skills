@@ -17,7 +17,11 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from _test_support import load_module, strip_ansi
+from _test_support import isolate_host_markers, load_module, strip_ansi
+
+
+def setUpModule():
+    isolate_host_markers()
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 PLUGIN_ROOT = SCRIPTS.parent
@@ -104,6 +108,81 @@ class DiscoveryRuntimeTests(unittest.TestCase):
         self.assertIsInstance(block, str)
         target_read.assert_not_called()
         cli.assert_not_called()
+
+
+class PluginMatchHostInferenceEndToEndTests(unittest.TestCase):
+    """W-24599110 end to end: a plugin enabled only in Claude's settings.json is
+    still recommended when Codex's env markers say the host is Codex, and still
+    suppressed on the Claude default. Ambient markers are cleared explicitly."""
+
+    _KEYS = (
+        "SF_AGENT_CLIENT", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_HOME",
+        "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CONFIG_DIR", "SF_DISABLE_PLUGIN_MATCH", "SF_PLUGIN_MATCH_SENSITIVITY",
+    )
+    PLUGIN = "experience-react"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        home = root / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text(
+            json.dumps({"enabledPlugins": {f"{self.PLUGIN}@salesforce": True}}),
+            encoding="utf-8")
+        (root / "codex-home").mkdir()
+        env = {k: v for k, v in os.environ.items() if k not in self._KEYS}
+        env["HOME"] = str(home)
+        self.env = env
+        self.codex_home = str(root / "codex-home")
+        plugins = [{"name": self.PLUGIN, "match": {"description": self.PLUGIN}}]
+        self.catalog = types.SimpleNamespace(
+            load_catalog=lambda r: {"plugins": plugins},
+            score_prompt_against_catalog=lambda text, catalog, **kw: [
+                types.SimpleNamespace(plugin=p, band="high", score=5.0)
+                for p in catalog["plugins"]],
+        )
+        patches = [
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sfx, "_plugin_root", return_value=str(root / "worktree-plugin")),
+            mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=self.catalog),
+            mock.patch.object(sfx, "_plugin_display_name", return_value="salesforce-development"),
+            mock.patch.object(sfx, "_plugin_match_sensitivity", return_value="standard"),
+            mock.patch.object(sfx, "_fire_plugin_telemetry_event"),
+            mock.patch.object(sfx.subprocess, "run",
+                              return_value=mock.Mock(returncode=0, stdout='{"installed": []}')),
+        ]
+        for attr in ("_PLUGIN_PROPOSAL_DIR", "_PLUGIN_FLOW_DIR",
+                     "_PLUGIN_INSTALL_PENDING_DIR", "_PLUGIN_LAST_OFFER_DIR"):
+            patches.append(mock.patch.object(sfx, attr, root / attr))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _names(self, session):
+        with mock.patch.object(sfx, "_save_plugin_proposals"):
+            matches = sfx._plugin_catalog_match(
+                "build a react app", session, surface="bypass-gate")
+        return [m["name"] for m in matches]
+
+    def test_claude_enabled_plugin_is_recommended_under_codex_markers(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1", "CODEX_HOME": self.codex_home}):
+            self.assertEqual([self.PLUGIN], self._names("codex:t1"))
+
+    def test_claude_enabled_plugin_is_suppressed_on_the_claude_default(self):
+        self.assertEqual([], self._names("sess-claude"))
+
+    def test_claude_enabled_plugin_is_recommended_when_host_is_unknown(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1", "CLAUDECODE": "1"}):
+            self.assertEqual([self.PLUGIN], self._names("sess-unknown"))
+
+    def test_plugin_match_command_recommends_under_codex_markers_without_client_flag(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1", "CODEX_HOME": self.codex_home}), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_match(["--session-id", "t1", "--json", "build a react app"])
+        self.assertEqual(0, rc)
+        self.assertEqual([self.PLUGIN], [m["name"] for m in json.loads(out.getvalue())["matches"]])
 
 
 class BannerProvenanceTests(unittest.TestCase):
@@ -240,7 +319,8 @@ class BannerProvenanceTests(unittest.TestCase):
             stub = types.SimpleNamespace(
                 load_catalog=lambda _root: {"plugins": [{"name": "shared"}] * 1_000_000}
             )
-            with mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=stub):
+            with mock.patch.object(sfx, "_load_plugin_catalog_module", return_value=stub), \
+                    mock.patch.object(sfx, "_plugin_client", return_value="claude"):
                 block = strip_ansi(sfx.render_banner_block(root))
         self.assertTrue(all(sfx._is_width_exempt(line) or len(line) <= 80 for line in block.splitlines()), block)
         self.assertIn(sfx.BANNER_WORDMARK, block)
@@ -351,18 +431,19 @@ class EnvironmentBandTests(unittest.TestCase):
 
     def test_environment_band_lists_real_servers_and_one_indicator(self):
         msg = self.message()
-        for name in ("api-context", "metadata-experts"):
+        for name in ("metadata-experts",):
             self.assertIn(name, msg)
+        self.assertNotIn("api-context", msg)
         self.assertNotIn("apex+soql-lsp", msg)        # the comp's relabel, not the configured id
         mcp_line = next(l for l in msg.splitlines() if l.startswith("MCP:"))
-        # WIN-033/040: the health line lists ONLY the two platform servers the single
+        # WIN-033/040: the health line lists ONLY the platform server the single
         # glyph actually reflects. salesforce-lsp is a local stdio process (not
         # org-gated, never remotely probed), so it is excluded — listing it beside a
         # glyph that never covers it would mislead. See CONTRACT-mcp-health.md.
         self.assertNotIn("lsp", mcp_line)
         indicators = sum(mcp_line.count(s) for s in ("⟳ connecting", "✓ connected", "✗ unavailable", "⚠ partial"))
         self.assertEqual(indicators, 1)               # one tri-state indicator, never per-server
-        self.assertNotRegex(mcp_line, r"(api-context|metadata-experts)\s+✓")
+        self.assertNotRegex(mcp_line, r"metadata-experts\s+✓")
 
     def test_stale_auth_shows_warning_not_check(self):
         band = strip_ansi("\n".join(sfx.render_environment_band(
@@ -966,6 +1047,70 @@ class SessionStartPointerTests(unittest.TestCase):
         rule = sfx.ORIENTATION_DIRECTIVE
         self.assertRegex(rule, r"(?i)already\s+displayed the journey hints")   # may wrap
         self.assertRegex(rule, r"(?i)skip this step")
+        self.assertLessEqual(len(rule.splitlines()), 24)   # shares the injected-context budget
+
+    def test_org_values_rule_reaches_the_agent_on_every_session_start_path(self):
+        """An org's cap or setting must be read, never filled in from documentation.
+
+        Seen in an end-to-end run: the SOQL skill counted Case's 17 tracked fields, then
+        answered "3 more" from the documented cap of 20 in an org whose cap is 200. The
+        rule rides every agent-facing path, including the post-compaction reinject, and
+        stays out of the visible banner.
+        """
+        for opt_in, rule in {"enabled": sfx.ORG_VALUES_DIRECTIVE,
+                             "disabled": sfx.ORG_VALUES_DIRECTIVE_NO_H360}.items():
+            rule = rule.strip()
+            with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_HEADLESS_360_ENABLED": opt_in}):
+                for label, configured_target in {"configured": "fixture", "no-default-org": None}.items():
+                    with self.subTest(h360=opt_in, path=label), ExitStack() as stack:
+                        self.make_project()
+                        for patch in self.normal_patches():
+                            stack.enter_context(patch)
+                        stack.enter_context(mock.patch.object(
+                            sfx, "_configured_target_alias", return_value=configured_target
+                        ))
+                        _, result = self.capture_detect()
+                        self.assertIn(rule, result["hookSpecificOutput"]["additionalContext"])
+                        self.assertNotIn("Org-specific values", result.get("systemMessage", ""))
+
+                with self.subTest(h360=opt_in, path="non-project"):
+                    self.cwd.joinpath("sfdx-project.json").unlink()
+                    _, result = self.capture_detect()
+                    self.assertIn(rule, result["hookSpecificOutput"]["additionalContext"])
+
+                with self.subTest(h360=opt_in, path="compact"):
+                    self.make_project()
+                    _, result = self.capture_detect("compact")
+                    self.assertIn(rule, result["hookSpecificOutput"]["additionalContext"])
+
+    def test_org_values_rule_omits_h360_tools_unless_opted_in(self):
+        """Users who haven't opted in can't have H360 connected, so the injected
+        context must not send the model looking for its tools."""
+        for opt_in in ("disabled", "", "nonsense"):
+            with self.subTest(h360=opt_in), \
+                    mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_HEADLESS_360_ENABLED": opt_in}):
+                self.make_project()
+                _, result = self.capture_detect("compact")
+                context = result["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(sfx.ORG_VALUES_DIRECTIVE_NO_H360.strip(), context)
+                self.assertNotIn("dispatch_readonly", context)
+                self.assertNotIn("Headless 360", context)
+        rule = sfx.ORG_VALUES_DIRECTIVE_NO_H360
+        self.assertRegex(rule, r"(?i)never take")
+        self.assertRegex(rule, r"(?i)unverified")
+
+    def test_org_values_rule_keeps_the_hierarchy_and_names_h360_only_when_present(self):
+        """Skills and `sf` stay first. SessionStart can't see MCP connections, so H360 is
+        conditional on its tools being present; with no reader, the value is unverified."""
+        rule = sfx.ORG_VALUES_DIRECTIVE
+        self.assertRegex(rule, r"(?i)never take")
+        self.assertRegex(rule, r"(?i)docs\s+or defaults")
+        self.assertLess(rule.index("skill or `sf`"), rule.index("Headless 360"))
+        self.assertIn("if Headless 360\ntools are present", rule)
+        self.assertIn("`discover` finds a candidate, not a value", rule)
+        self.assertIn("`describe` it", rule)
+        self.assertIn("`dispatch_readonly`", rule)
+        self.assertRegex(rule, r"(?i)unverified")
         self.assertLessEqual(len(rule.splitlines()), 24)   # shares the injected-context budget
 
     def test_compact_reinjects_pointer_without_visible_banner_or_probe(self):
@@ -3716,6 +3861,8 @@ class CommandPaintTests(unittest.TestCase):
     STATUS_META = {"name": "acme-crm", "source_api": "63.0", "package_dirs": "force-app"}
     STATUS_STATS = {"apex_src": 3, "apex_test": 1, "triggers": 0, "lwc": 2,
                     "aura": 0, "objects": 5, "permsets": 1, "flows": 0}
+    # Pinned so the status paints never run a live optional grounding probe.
+    GROUNDING_ROW = {"status": "info", "message": "Optional; not yet checked"}
 
     def setUp(self):
         # cmd_command_paint should touch none of these, but sandbox cwd + the marker /
@@ -4010,7 +4157,8 @@ class CommandPaintTests(unittest.TestCase):
                         mock.patch.object(sfx, "project_meta", return_value=self.STATUS_META), \
                         mock.patch.object(sfx, "project_stats", return_value=self.STATUS_STATS), \
                         mock.patch.object(sfx, "git_status_line", return_value=""), \
-                        mock.patch.object(sfx, "_live_mcp_summary", return_value="1 connected"):
+                        mock.patch.object(sfx, "_live_mcp_summary", return_value="1 connected"), \
+                        mock.patch.object(sfx, "_grounding_status_row", return_value=self.GROUNDING_ROW):
                     code, result = self.capture("", command_name=command)
                 self.assertEqual(code, 0)
                 self.assertEqual(
@@ -4044,6 +4192,7 @@ class CommandPaintTests(unittest.TestCase):
                         mock.patch.object(sfx, "project_stats", return_value=self.STATUS_STATS), \
                         mock.patch.object(sfx, "git_status_line", return_value=""), \
                         mock.patch.object(sfx, "_live_mcp_summary", return_value=""), \
+                        mock.patch.object(sfx, "_grounding_status_row", return_value=self.GROUNDING_ROW), \
                         mock.patch.object(sfx, "render_status_surface",
                                           wraps=sfx.render_status_surface) as rss:
                     code, _ = self.capture("", command_name=command)

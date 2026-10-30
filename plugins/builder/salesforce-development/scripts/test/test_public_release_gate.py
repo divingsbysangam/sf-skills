@@ -65,6 +65,18 @@ class PublicReleaseGateTests(unittest.TestCase):
         return plugin, authoring
 
     @staticmethod
+    def stage_release_ci(synthetic_repo: Path) -> None:
+        """Give a synthetic repo the release-ci modules the verifier shells out to.
+
+        The verifier reads skill descriptions through public-manifest.mjs, located
+        relative to the authoring root's parent.
+        """
+        release_ci = synthetic_repo / "scripts/release-ci"
+        release_ci.mkdir(parents=True, exist_ok=True)
+        for module in ("public-manifest.mjs", "sanitize-public-skills.mjs"):
+            shutil.copy(REPO_ROOT / "scripts/release-ci" / module, release_ci / module)
+
+    @staticmethod
     def write_skill(root: Path, name: str, description: str) -> Path:
         skill = root / name
         skill.mkdir(parents=True)
@@ -84,6 +96,7 @@ class PublicReleaseGateTests(unittest.TestCase):
     ):
         """Run leak/tree verification without the unrelated real catalog."""
         manifest = {"skills": [{"name": name} for name in public_names]}
+        self.stage_release_ci(authoring.parent)
         with (
             patch.object(self.gate, "_load_public_manifest", return_value=manifest),
             patch.object(self.gate.plugin_catalog, "check", return_value=True),
@@ -189,6 +202,7 @@ class PublicReleaseGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             plugin, authoring = self.make_empty_tree(Path(td))
             (plugin / "broken.json").write_text('{"nested": [', encoding="utf-8")
+            self.stage_release_ci(authoring.parent)
             stderr = io.StringIO()
             with (
                 patch.object(self.gate, "_load_public_manifest", return_value={"skills": []}),

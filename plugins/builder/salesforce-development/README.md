@@ -1,12 +1,14 @@
 # salesforce-development
 
-**AI-powered Salesforce platform development in Claude Code**
+**Salesforce platform development for agents**
 
-The foundation plugin for building apps and agents on the Salesforce Platform. When you open Claude Code in a Salesforce DX project, this plugin auto-detects your environment, injects org context, and provides AI assistance through validated skills, the Salesforce CLI, and Salesforce hosted MCP servers. The plugin uses this three-tier capability resolution: Skills (primary) → Salesforce CLI (secondary) → Salesforce MCP (last resort). Simply use natural language to describe what you want to build — no need to memorize any slash commands.
+Build apps and agents on the Salesforce Platform with shared skills, Salesforce CLI, and configured MCP tools. The plugin uses your Salesforce DX project and selected org to guide development. Describe your task in natural language.
+
+Choose your coding agent: [Claude Code quick start](#quick-start) or [Use with Codex](#use-with-codex). Each coding agent loads its supported commands and hooks; see the setup and behavior below.
 
 ## Quick Start
 
-This quick start describes the required software you must install, how to authorize your Salesforce org, and how to install this plugin from Anthropic's official Claude Code plugin marketplace.
+This quick start covers Claude Code. For Codex CLI 0.145.0 or later on a POSIX host with Bash and Python 3.8 or later, see [Use with Codex](#use-with-codex).
 
 1. **Install prerequisites:**
    - [Claude Code](https://claude.ai/code) — requires Claude Code 2.1.222 or later
@@ -23,11 +25,13 @@ This quick start describes the required software you must install, how to author
    ```text
    /plugin install salesforce-development@claude-plugins-official
    ```
-   Alternatively, install from the Salesforce-hosted marketplace:
+   Marketplace versions can differ. Check the installed version in `/plugin`. To use the latest
+   release published by Salesforce, install from the Salesforce-hosted marketplace:
    ```text
    /plugin marketplace add forcedotcom/sf-skills
    /plugin install salesforce-development@salesforce
    ```
+   If switching marketplaces, use `/plugin` to disable the previous copy so only one copy is enabled.
 
 4. (Optional) Validate your environment:
    ```text
@@ -48,7 +52,7 @@ Once you're all set up, use natural language to describe what you want to do; th
 - "Build a permission set that grants read access to Accounts and Contacts."
 - “What can I do here?”
 
-## Verify, Update, and Uninstall the Plugin
+## Verify, Update, and Uninstall in Claude Code
 
 - **Verify:** `/plugin` lists `salesforce-development`. `/salesforce-development:status` shows the org/project banner. `"${CLAUDE_PLUGIN_ROOT}"/bin/lsp-doctor` checks the bundled language-server host.
 - **Update:** if you installed from `claude-plugins-official`, updates happen automatically; to update manually run `/plugin update salesforce-development@claude-plugins-official`. If you installed from the `salesforce` marketplace, run `/plugin marketplace update salesforce` then `/plugin update salesforce-development@salesforce`.
@@ -56,50 +60,62 @@ Once you're all set up, use natural language to describe what you want to do; th
 
 ## What's Included
 
-### 37 Skills
+### Skills
 
 | Area | Skills |
 |------|--------|
-| **Discovery** | `platform-capability-search` — Public-channel overview of 102 released and 40 foundation capabilities (29 overlap; 113 visible), domain drilldown, skill detail with hash provenance, compact machine index, pinned one-step enable guidance, and explicitly on-demand cached org-feature detection |
+| **Discovery** | `platform-capability-search` — Generated public-channel capability overview, domain drilldown, installed-versus-available guidance, and on-demand org-feature detection |
 | **Environment** | `platform-environment-validate` — Prerequisite scan (Salesforce CLI, Code Analyzer, Node, NPM, Git, MCP, source tracking) with guided installation and update |
 | **Project and org lifecycle** | `dx-project-create` — Scaffold a new Salesforce DX project from scratch (template → generate → relocate → auth → default → source tracking); `dx-org-manage` — Create scratch orgs, take org snapshots, open orgs in the browser |
 | **Apex** | `platform-apex-generate`, `platform-apex-anonymous-run` (anonymous Apex + debug-log capture), `platform-apex-test-generate`, `platform-apex-test-run`, `platform-apex-logs-debug` |
 | **Automation** | `automation-flow-generate` — Screen, Autolaunched, Record-Triggered, and Scheduled Flows |
 | **Declarative metadata** | `platform-custom-object-generate`, `platform-custom-field-generate`, `platform-custom-metadata-type-generate`, `platform-custom-setting-generate`, `platform-custom-application-generate`, `platform-custom-tab-generate`, `platform-custom-report-type-generate`, `platform-list-view-generate`, `platform-value-set-generate`, `platform-validation-rule-generate`, `platform-flexipage-generate`, `platform-lightning-app-coordinate` |
 | **Data and API context** | `platform-data-manage` — Create, update, delete, import, export, seed, and clean up org records; `platform-soql-query` — SOQL/SOSL authoring, optimization, and query-plan analysis; `platform-data-and-tooling-api-context-get` — Standard-object and Tooling API field/schema reference |
-| **Deploy and retrieve** | `platform-metadata-deploy`, `platform-metadata-retrieve`, `platform-manifest-generate` (build `package.xml` / `destructiveChanges.xml`), `platform-metadata-api-context-get`, `platform-deploy-validate`, `platform-quick-deploy`, `platform-destructive-deploy` |
+| **Metadata discovery** | `platform-metadata-discovery-get` — Find what already exists in the org and pick the right tool (metadata grounding, scoped SOQL, `sf sobject`, `sf org list metadata`, source retrieval); `platform-metadata-grounding-get` — Find metadata by meaning when the API name is unknown, via the Metadata Grounding MCP (requires Salesforce Catalog in the org) |
+| **Deploy and retrieve** | `platform-metadata-deploy` (incl. the production validate → quick-deploy path), `platform-metadata-retrieve`, `platform-manifest-generate` (build `package.xml` / `destructiveChanges.xml`), `platform-metadata-api-context-get`, `platform-destructive-deploy` |
 | **Security** | `platform-permission-set-generate`, `platform-sharing-owd-configure`, `platform-sharing-rules-generate` |
 | **Reporting** | `platform-report-generate` |
 | **LSP** | `platform-lsp-integrate` — Contract and fallbacks for the bundled language-server tools |
+| **Headless 360 MCP** | `platform-headless-360-integrate` — Setup, call contract, and errors for the Salesforce-hosted Headless 360 MCP server (`discover`, `describe`, `dispatch`), with confirm-before-write. Task-specific Setup workflows, including Field History Tracking, are discovered and described from H360 at runtime. |
 
 ### What Else Is in the Box
 
-- **Agents** — `salesforce-dev`, the primary Salesforce development agent (activates automatically in Salesforce projects — `sfdx-project.json` present — and routes requests skills-first, then SF CLI, then direct API as a last resort). Code-analysis and Well-Architected review — the `dx-code-analyzer-*` skills, `platform-architecture-analyze`, and the read-only `architecture-review` agent — now live in the separate **salesforce-code-quality** plugin.
-- **Slash commands** — `/salesforce-development:discover` (computed public-channel capability overview/drilldown, `plugins <text>` for on-demand uninstalled-plugin matching, and optional on-demand `features [--target-org <alias>] [--refresh] [--json]`), `:plugin-install` (one-confirmation install for a trusted same-session marketplace recommendation; source confirmation for anything else), `:plugin-recommendations` (view or change how readily uninstalled plugins get proposed), `:telemetry`, `:setup`, `:status`, `:org`, `:login`, `:logout`, `:set-default`, `:project`, `:reset-source-tracking`, `:welcome`, `:feedback` (manual-only — see [Feedback](#-feedback) below).
-- **MCP servers** — `salesforce-api-context` and `salesforce-metadata-experts` (API/metadata guidance), and `salesforce-lsp`, a local host that lazily spawns the **Apex** and **SOQL** language servers and exposes their semantic capabilities as MCP tools. See the `platform-lsp-integrate` skill for the tool contract.
+- **Claude Code agents** — `salesforce-dev`, the primary Salesforce development agent (activates automatically in Salesforce projects — `sfdx-project.json` present — and routes requests skills-first, then SF CLI, then direct API as a last resort). Code-analysis and Well-Architected review — the `dx-code-analyzer-*` skills, `platform-architecture-analyze`, and the read-only `architecture-review` agent — now live in the separate **salesforce-code-quality** plugin.
+- **Claude Code slash commands** — `/salesforce-development:discover` (computed public-channel capability overview/drilldown, `plugins <text>` for on-demand uninstalled-plugin matching, and optional on-demand `features [--target-org <alias>] [--refresh] [--json]`), `:plugin-install` (one-confirmation install for a trusted same-session marketplace recommendation; source confirmation for anything else), `:plugin-recommendations` (view or change how readily uninstalled plugins get proposed; add `--project` to change it for the current project only), `:telemetry`, `:setup`, `:status`, `:org`, `:login`, `:logout`, `:set-default`, `:project`, `:reset-source-tracking`, `:welcome`, `:feedback` (manual-only — see [Feedback](#-feedback) below).
+- **Headless 360 opt-in** — H360 defaults off. In disabled mode its launcher completes an empty MCP handshake without starting the proxy, minting auth, or making network requests. Claude Code users enable the **Headless 360 MCP server** plugin setting. Codex CLI and desktop users ask **“Enable Headless 360 in Codex”** to save a local preference, then start a new session normally. No special environment variable or terminal launch is required for that saved opt-in. Enable it only after H360 has been activated in the target org. See `platform-headless-360-integrate` for setup and validation scope, and the [integration design](docs/design/headless-360-mcp-server.md) for startup, authentication, and agent flows.
+
+  Codex saves this user-wide preference and the installed launcher's location in `~/.sf/salesforce-development/headless-360.json`, outside the plugin cache, so the preference survives plugin updates and applies to both CLI and desktop. H360 inherits the selected chat's project directory, rather than the plugin cache or the desktop app's launch directory. If a plugin version update reports that setup is required, ask to enable H360 again to refresh the launcher registration. Ask to disable it to save `false`; neither action changes an org. After registering the launcher, advanced users can still override the opt-in with `SF_HEADLESS_360_ENABLED=enabled|disabled`. Existing environment-only setups must run the local enable command once to register the launcher. If an override is present, it takes precedence over the saved setting. The launcher honors Node on PATH first, then checks `~/.local/bin`, `~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `/opt/homebrew/bin`, and `/usr/local/bin`. Node must be installed; it does not download a runtime or source shell profiles. Arbitrary version-manager locations may still require PATH configuration.
+- **MCP servers** — `salesforce-metadata-experts` (metadata guidance), `salesforce-metadata-grounding` (finds metadata by meaning through Salesforce Catalog; available in orgs where Catalog is provisioned. `status` and setup report it as an optional row that warns when it is not connected, without blocking), `salesforce-headless-360` (the optional Salesforce-hosted Headless 360 server: org state, Setup settings, and feature access that no CLI command reads; disabled by default. `status` and setup report H360 separately, recommend enabling it for live Setup answers, and probe only when local opt-in is known enabled. Cached health is labeled; endpoint reachability does not prove host tool exposure. See `platform-headless-360-integrate`), and `salesforce-lsp`, a local host that lazily spawns the **Apex** and **SOQL** language servers and exposes their semantic capabilities as MCP tools. See the `platform-lsp-integrate` skill for the tool contract.
 - **Hooks** — org-context detection on session start; a production deploy-safety gate and an Apex pre-deploy diagnostics gate on `sf project deploy`; and skills-first advisories that, when no installed skill matches, also propose an uninstalled plugin whose curated description does.
 
-Your progress through **Connect → Project → Build → Test → Deploy → Observe** is tracked from real, successful actions in your project — never assumed. Run `/salesforce-development:discover journey inspect` to review it, or `journey reset` to clear it.
+In Claude Code, your progress through **Connect → Project → Build → Test → Deploy → Observe** is tracked from real, successful actions in your project — never assumed. Run `/salesforce-development:discover journey inspect` to review it, or `journey reset` to clear it.
 
 ## 💬 Feedback
 
-Run `/salesforce-development:feedback` any time to tell us how things are going. It's a manual-only
+In Claude Code, run `/salesforce-development:feedback` to submit a rating. It's a manual-only
 command (it never shows up in the model's own suggestions) that asks a single 1-5 satisfaction
 question right in chat and records it as a local telemetry event — the only thing that leaves your
 machine is that numeric rating, tagged the same coarse way as every other telemetry event.
 
+The manual feedback command doesn't collect ratings in Codex. Its optional end-of-turn numeric prompt requires `SFDX_FEEDBACK=1`, enabled telemetry, and eligible activity.
+
 ## More Information
 
+- **[Developer guide](https://developer.salesforce.com/docs/platform/salesforce-skills-plugins/guide/salesforce-development-overview.html)** — installation, project and org setup, examples, and troubleshooting.
 - **[Configuration reference](./docs/configuration.md)** — ambient UI modes and deploy/delete guard rails.
 - **[Changelog](https://github.com/forcedotcom/sf-skills/blob/main/plugins/builder/salesforce-development/CHANGELOG.md)** — what's new in each release.
 - To skip Claude Code's permission prompts for the CLI commands this plugin runs (`sf`, `node`, `npm`, read-only `git`), add the equivalent allow-rules to your DX project's `.claude/settings.json`. See [Settings](https://code.claude.com/docs/en/settings#permission-settings) in the Claude Code docs. This plugin doesn't ship a `settings.json` of its own.
 - Third-party code bundled with this plugin (such as the vendored Apex language server and a few esbuild-bundled MCP dependencies) is attributed in [`NOTICE`](./NOTICE).
 
-## Codex lifecycle support
+<a id="codex-lifecycle-support"></a>
+
+## Use with Codex
 
 ### Install, enable and uninstall
 
-Register a local checkout with `codex plugin marketplace add <repository-checkout> --json`, then
+Use Codex CLI 0.145.0 or later, Bash, and Python 3.8 or later on a POSIX host. Clone a release of [sf-skills](https://github.com/forcedotcom/sf-skills) that includes the Codex manifests. The shared marketplace catalog is `.claude-plugin/marketplace.json`.
+
+Register the local checkout with `codex plugin marketplace add <repository-checkout> --json`, then
 install with `codex plugin add salesforce-development@salesforce --json`; repeating that add
 command refreshes the installed files. Enable or disable the plugin through the Codex setting
 `plugins."salesforce-development@salesforce".enabled`, and uninstall with
@@ -107,24 +123,21 @@ command refreshes the installed files. Enable or disable the plugin through the 
 any of these changes. The package declares its Codex hooks separately from the Claude manifest;
 review and trust them through Codex `/hooks` before relying on their safety checks.
 
-Every builder plugin carries a `.codex-plugin/plugin.json`, so Codex can recommend it and install
+Every public builder plugin carries a `.codex-plugin/plugin.json`, so Codex can recommend it and install
 it through the guarded Salesforce Development flow (never a raw
 `codex plugin add`: the guarded flow keeps the source/trust check, installs one named plugin at a
 time, and requires a new Codex session). This includes `salesforce-test-drive`, whose native
 Codex adapter supports recommendation and guarded installation. Claude-only hooks and agents in
 those plugins (for example the `agentforce-adlc` guardrails and validator hooks) are not carried
-over to Codex. Installation and a native Codex surface are not evidence that every end-to-end
-workflow is verified in Codex; temporarily withhold a host-incompatible plugin by adding it to
-`_CODEX_UNVERIFIED_WORKFLOW_PLUGINS` in `scripts/sf_context.py`.
+over to Codex. See [Test Drive's Codex setup](../salesforce-test-drive/README.md#use-with-codex) for its start workflow and plugin-management instructions.
 
 ### Invoking commands on Codex
 
-Codex does not support `/plugin:command` slash commands. It converts each command in a plugin's
-`codex-commands/` into a skill when the plugin is installed, so ask for the workflow in plain
-language (for example, "run the Salesforce Development status workflow") or pick it from the `$`
-skill list. This needs a Codex build that includes command migration (0.145.0 or later), and
-a plugin installed or updated after that build. Messages the plugin generates on Codex use this
-wording instead of `/salesforce-development:<name>`.
+Codex does not support `/plugin:command` slash commands. With Codex CLI 0.145.0 or later, plugin
+commands are migrated to skills when the plugin is installed or updated. Ask for the workflow in
+plain language (for example, "run the Salesforce Development status workflow") or choose it from
+the `$` skill list. Messages generated on Codex use this wording instead of
+`/salesforce-development:<name>`.
 
 ### Environment variables
 
@@ -138,7 +151,8 @@ wording instead of `/salesforce-development:<name>`.
 ### Behavior and known limits
 
 - SessionStart shows a local-only banner (project facts and the configured org alias, no org, git
-  or MCP probe); ask for Salesforce status for live details. A resumed session reuses its banner.
+  or MCP probe) and skills-first instructions: matching installed skills, then Salesforce CLI,
+  then APIs. Ask for Salesforce status for live details. A resumed session reuses its banner.
 - The shell hook verifies the target org and applies the production and destructive-deployment
   checks. Run one literal deploy/delete per shell call, from the session's working directory,
   without inline `cd`, `export`, `env`, variable assignments or `sf config set`. A deploy or
@@ -162,7 +176,7 @@ wording instead of `/salesforce-development:<name>`.
   to recover.
 - Hook callbacks run `python3` and the bash deploy gate, so they need a POSIX host. If the hook itself fails, a shell command that could deploy or delete is denied and other tool
   calls proceed with a warning. Callback startup failures and host timeouts are outside the adapter's
-  fail-closed guarantee. Remote API-context and metadata MCP servers need
+  fail-closed guarantee. The remote metadata MCP server needs
   credential access inside the host sandbox; CLI and packaged context-file fallbacks remain.
 - Codex command adapters reference the packaged shared workflows. The feedback command surface
   does not collect a rating. Login checks installed CLI support before offering device-code

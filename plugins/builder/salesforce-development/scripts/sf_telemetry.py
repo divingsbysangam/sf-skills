@@ -355,6 +355,7 @@ _PLUGIN_INSTALL_REASONS = frozenset({
     "proposal_not_selected",
     "stale_nonce",
     "subprocess_failure",
+    "host_unclear",
 })
 
 _PLUGIN_RECOMMENDATION_ACTIONS = frozenset({"disable", "reset", "set"})
@@ -1044,9 +1045,10 @@ def _resolve_sf_agent(agent_type: str) -> str:
 # `mcp__customer-alice@example.com__query`), so we never record an unrecognized
 # server or its tool verbatim.
 _MCP_SERVERS = frozenset({
-    "salesforce-api-context",
     "salesforce-lsp",
     "salesforce-metadata-experts",
+    "salesforce-metadata-grounding",
+    "salesforce-headless-360",
 })
 
 
@@ -1114,13 +1116,19 @@ def _agent_harness() -> str:
     the plugin. Codex lifecycle adapters explicitly select their host; Claude
     retains precedence among inherited editor markers on its own hook path."""
     env = os.environ
-    if env.get("SF_AGENT_CLIENT") == "codex":
+    explicit = env.get("SF_AGENT_CLIENT", "").strip().lower()
+    if explicit == "codex":
         return "codex"
+    if explicit == "claude":
+        return "claude-code"
     # Claude Code (and Claude Desktop, same engine — env cannot separate them).
     # CLAUDE_CODE_CHILD_SESSION is set ONLY by Claude Code itself (not IDE-integrated
     # terminals), so it is the most precise "Claude Code spawned this" signal.
-    if env.get("CLAUDE_CODE_CHILD_SESSION") == "1" or env.get("CLAUDECODE") == "1":
+    if (env.get("CLAUDE_CODE_CHILD_SESSION") == "1" or env.get("CLAUDECODE") == "1"
+            or env.get("CLAUDE_CODE_SESSION_ID", "").strip()):
         return "claude-code"
+    if any(env.get(key, "").strip() for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID")):
+        return "codex"
     if env.get("CURSOR_AGENT"):
         return "cursor"
     if env.get("CODEX_HOME"):

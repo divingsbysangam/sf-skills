@@ -189,6 +189,23 @@ def _json_strings(value, depth: int = 0) -> Iterator[str]:
             yield from _json_strings(item, depth + 1)
 
 
+def _run_public_manifest(repo_root: Path, args: list[str], what: str) -> object:
+    """Run a read-only mode of public-manifest.mjs and parse its JSON stdout."""
+    script = repo_root / "scripts/release-ci/public-manifest.mjs"
+    try:
+        result = subprocess.run(
+            ["node", str(script), *args], capture_output=True, text=True, timeout=60,
+        )
+    except OSError as exc:
+        raise registry.RegistryError(f"cannot {what}: {exc}") from exc
+    if result.returncode != 0:
+        raise registry.RegistryError(f"cannot {what}: {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise registry.RegistryError(f"cannot {what}: {exc}") from exc
+
+
 def _load_public_manifest(repo_root: Path) -> dict:
     """Load and validate the public release manifest via the module that owns it.
 
@@ -196,21 +213,21 @@ def _load_public_manifest(repo_root: Path) -> dict:
     (JS, matching this repo's release-ci convention) rather than in capability_registry.py, so
     this shells out to that module's ``--load`` mode instead of importing it directly.
     """
-    script = repo_root / "scripts/release-ci/public-manifest.mjs"
     manifest_path = repo_root / "scripts/release-ci/public-release-manifest.json"
-    try:
-        result = subprocess.run(
-            ["node", str(script), "--load", str(manifest_path)],
-            capture_output=True, text=True, timeout=60,
-        )
-    except OSError as exc:
-        raise registry.RegistryError(f"cannot load public release manifest: {exc}") from exc
-    if result.returncode != 0:
-        raise registry.RegistryError(f"cannot load public release manifest: {result.stderr.strip()}")
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise registry.RegistryError(f"cannot load public release manifest: {exc}") from exc
+    return _run_public_manifest(
+        repo_root, ["--load", str(manifest_path)], "load public release manifest"
+    )
+
+
+def _skill_descriptions(repo_root: Path, skills_root: Path) -> dict[str, str]:
+    """Map skill name -> description for every skill under ``skills_root``.
+
+    SKILL.md parsing (including the headless-only description-cap carve-out) lives in
+    public-manifest.mjs's ``--read-skills`` mode, not in the shipped plugin.
+    """
+    return _run_public_manifest(
+        repo_root, ["--read-skills", str(skills_root)], f"read skills under {skills_root}"
+    )
 
 
 def verify(
@@ -224,21 +241,20 @@ def verify(
     plugin_catalog.check(repo_root, plugin_root)
 
     public = {row["name"] for row in manifest["skills"]}
-    foundation = set(registry.skill_directories(plugin_root / "skills"))
-    authoring = set(registry.skill_directories(authoring_root))
+    foundation = set(_skill_descriptions(repo_root, plugin_root / "skills"))
+    authoring_inventory = _skill_descriptions(repo_root, authoring_root)
+    authoring = set(authoring_inventory)
     protected_names = sorted((public - foundation) | (authoring - public - foundation))
     protected: list[tuple[str, str, bytes]] = []
     seen_descriptions: set[tuple[str, str]] = set()
-    roots = [authoring_root]
+    inventories = [authoring_inventory]
     if public_root is not None:
-        roots.append(public_root)
-    for source_root in roots:
-        source_inventory = registry.skill_directories(source_root)
+        inventories.append(_skill_descriptions(repo_root, public_root))
+    for source_inventory in inventories:
         for name in protected_names:
-            source_dir = source_inventory.get(name)
-            if source_dir is None:
+            description = source_inventory.get(name)
+            if description is None:
                 continue
-            description = registry.read_skill(source_dir / "SKILL.md")["description"]
             identity = (name, description)
             if identity in seen_descriptions:
                 continue

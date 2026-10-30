@@ -25,6 +25,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 import types
 import unicodedata
@@ -43,7 +44,11 @@ _MODULE_PATH = Path(__file__).resolve().parent.parent / "sf_context.py"
 CATALOG_MODULE_PATH = Path(__file__).resolve().parent.parent / "plugin_catalog.py"
 PLUGIN_JSON = Path(__file__).resolve().parent.parent.parent / ".claude-plugin/plugin.json"
 
-from _test_support import load_module  # noqa: E402
+from _test_support import HOST_MARKER_KEYS, isolate_host_markers, load_module  # noqa: E402
+
+
+def setUpModule():
+    isolate_host_markers()
 
 
 def _load_module():
@@ -707,6 +712,30 @@ class CheckToolsTests(unittest.TestCase):
         self.assertEqual(verdict["blockers"], [])                  # nothing critical
         self.assertIn("Salesforce CLI", verdict["needsAttention"])  # still surfaced
 
+    def test_check_tools_optional_grounding_warning_never_blocks(self):
+        # Metadata grounding is optional: not connected warns (surfaced in
+        # needsAttention) but never blocks scaffolding or reads as a blocker.
+        patches = self._mock_all_checks()[:-2] + [
+            mock.patch.object(sfx, "_check_mcp", return_value=[
+                {"name": "Salesforce MCP (config)", "status": "ok"},
+                {"name": "Salesforce MCP (metadata-grounding)", "status": "warn", "optional": True,
+                 "message": "Optional; not connected"},
+                {"name": "Salesforce MCP (process)", "status": "info"},
+            ]),
+            mock.patch.object(sfx, "resolve_executable", return_value="/usr/local/bin/tool"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self._run_check_tools()
+        finally:
+            for p in patches:
+                p.stop()
+        verdict = self._read_verdict()
+        self.assertTrue(verdict["ready"])
+        self.assertEqual(verdict["blockers"], [])
+        self.assertIn("Salesforce MCP (metadata-grounding)", verdict["needsAttention"])
+
     def test_check_tools_blockers_are_critical_only_not_warnings(self):
         # When a critical AND a warn coexist, ready is False (the critical blocks)
         # but `blockers` names ONLY the critical — the warn stays advisory in
@@ -812,13 +841,19 @@ class CheckToolsTests(unittest.TestCase):
         with mock.patch.object(sfx, "_probe_server",
                                 side_effect=lambda slug, timeout=None: {
                                     "name": sfx._mcp_row_name(slug), "status": "warn",
-                                    "version": None, "message": "stubbed"}):
+                                    "version": None, "message": "stubbed"}), \
+                mock.patch.object(sfx, "_probe_server_raw", return_value=None):
             rows = sfx._check_mcp()
         names = [r["name"] for r in rows]
         self.assertIn("Salesforce MCP (config)", names)
-        self.assertIn("Salesforce MCP (salesforce-api-context)", names)
+        self.assertNotIn("Salesforce MCP (salesforce-api-context)", names)
         self.assertIn("Salesforce MCP (metadata-experts)", names)
         self.assertIn("Salesforce MCP (process)", names)
+        # Grounding is reported after the required server, as an optional row.
+        self.assertLess(names.index("Salesforce MCP (metadata-experts)"),
+                        names.index("Salesforce MCP (metadata-grounding)"))
+        grounding_row = next(r for r in rows if r["name"] == "Salesforce MCP (metadata-grounding)")
+        self.assertTrue(grounding_row["optional"])
         process_row = next(r for r in rows if r["name"] == "Salesforce MCP (process)")
         # Process health is informational (not a warning), so a healthy setup can
         # read fully green — but it is never inferred "ok" from config/endpoint.
@@ -2251,8 +2286,8 @@ class McpHealthContractTests(unittest.TestCase):
     ("salesforce-metadata-experts")."""
 
     def test_slug_mapping_uses_slug_arg_not_server_key(self):
-        self.assertEqual(sfx._MCP_SERVER_SLUGS["salesforce-api-context"], "salesforce-api-context")
         self.assertEqual(sfx._MCP_SERVER_SLUGS["salesforce-metadata-experts"], "metadata-experts")
+        self.assertNotIn("salesforce-api-context", sfx._MCP_SERVER_SLUGS)
         self.assertNotIn("salesforce-metadata-experts", sfx._MCP_SERVER_SLUGS.values())
 
     def test_state_table_matches_contract(self):
@@ -2366,20 +2401,18 @@ class McpHealthContractTests(unittest.TestCase):
             return {"slug": slug, "state": state, "org": entry_org}
         return _reader
 
-    def test_summary_all_ok_reports_both_active(self):
+    def test_summary_all_ok_reports_active(self):
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"})):
+                                    {"metadata-experts": "ok"})):
             summary = sfx._passive_mcp_summary()
         self.assertIn("active", summary.lower())
         self.assertNotIn("not activated", summary.lower())
 
-    def test_summary_inactive_surfaces_not_activated_even_if_other_ok(self):
+    def test_summary_inactive_surfaces_not_activated(self):
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "inactive"})):
+                                    {"metadata-experts": "inactive"})):
             summary = sfx._passive_mcp_summary()
         self.assertIn("NOT activated", summary)
         self.assertIn("metadata-experts", summary)
@@ -2392,28 +2425,10 @@ class McpHealthContractTests(unittest.TestCase):
     def test_summary_mixed_degraded_points_at_check_tools(self):
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "auth"})):
+                                    {"metadata-experts": "auth"})):
             summary = sfx._passive_mcp_summary()
         self.assertIn("degraded", summary.lower())
         self.assertIn("check-tools", summary.lower())
-
-    # --- partial observation is PENDING, not an outage (review P1 #1) ---------
-    # One server ok, the other not yet observed (no sidecar), none bad: this is
-    # still connecting, so the summary must read as pending ("not yet observed"),
-    # never "degraded" — otherwise _mcp_indicator paints a false ✗ unavailable.
-    def test_summary_partial_ok_and_unobserved_is_pending_not_degraded(self):
-        with mock.patch.object(sfx, "_read_health_sidecar",
-                                side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok"})):  # metadata-experts absent
-            summary = sfx._passive_mcp_summary()
-        self.assertIn("not yet observed", summary.lower())
-        self.assertNotIn("degraded", summary.lower())
-        self.assertNotIn("active", summary.lower())  # not a full-green claim either
-        # And the banner icon derives to connecting, not unavailable.
-        icon, style = sfx._mcp_indicator(summary)
-        self.assertIn("connecting", icon)
-        self.assertNotIn("unavailable", icon)
 
     # --- org-scoped observations (review P1 #2) -------------------------------
     # A sidecar written against a DIFFERENT org must not be shown as healthy for
@@ -2422,8 +2437,7 @@ class McpHealthContractTests(unittest.TestCase):
         # Both servers ok, but recorded against "orgA"; active org is "orgB".
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"}, org="orgA")):
+                                    {"metadata-experts": "ok"}, org="orgA")):
             summary = sfx._passive_mcp_summary(active_org="orgB")
         # No usable observation for orgB -> neutral not-yet-observed, NOT active.
         self.assertIn("not yet observed", summary.lower())
@@ -2432,8 +2446,7 @@ class McpHealthContractTests(unittest.TestCase):
     def test_summary_accepts_sidecar_matching_active_org(self):
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"}, org="orgA")):
+                                    {"metadata-experts": "ok"}, org="orgA")):
             summary = sfx._passive_mcp_summary(active_org="orgA")
         self.assertIn("active", summary.lower())
 
@@ -2441,8 +2454,7 @@ class McpHealthContractTests(unittest.TestCase):
         # When the active org is unknown, fall back to state-only (no over-filter).
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"}, org="orgA")):
+                                    {"metadata-experts": "ok"}, org="orgA")):
             summary = sfx._passive_mcp_summary()  # no active_org
         self.assertIn("active", summary.lower())
 
@@ -2452,8 +2464,7 @@ class McpHealthContractTests(unittest.TestCase):
         # accept the username-stamped sidecar (not reject it as a foreign org).
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"},
+                                    {"metadata-experts": "ok"},
                                     org="user@example.com")):
             summary = sfx._passive_mcp_summary(
                 active_org=("myAlias", "user@example.com"))
@@ -2466,8 +2477,7 @@ class McpHealthContractTests(unittest.TestCase):
         # nor the username matches.
         with mock.patch.object(sfx, "_read_health_sidecar",
                                 side_effect=self._fake_sidecars(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"}, org="otherOrg")):
+                                    {"metadata-experts": "ok"}, org="otherOrg")):
             summary = sfx._passive_mcp_summary(
                 active_org=("myAlias", "user@example.com"))
         self.assertIn("not yet observed", summary.lower())
@@ -2493,12 +2503,10 @@ class McpHealthContractTests(unittest.TestCase):
         # Sidecars say inactive (stale); live probe says ok -> summary is active.
         with mock.patch.object(sfx, "_probe_server_raw",
                                 side_effect=self._fake_probes(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "ok"})), \
+                                    {"metadata-experts": "ok"})), \
                 mock.patch.object(sfx, "_read_health_sidecar",
                                   side_effect=self._fake_sidecars(
-                                      {"salesforce-api-context": "inactive",
-                                       "metadata-experts": "inactive"})):
+                                      {"metadata-experts": "inactive"})):
             summary = sfx._live_mcp_summary(active_org="liveOrg")
         self.assertIn("active", summary.lower())
         self.assertNotIn("not activated", summary.lower())
@@ -2507,12 +2515,10 @@ class McpHealthContractTests(unittest.TestCase):
         # The reverse: sidecar says ok (stale), live probe says inactive.
         with mock.patch.object(sfx, "_probe_server_raw",
                                 side_effect=self._fake_probes(
-                                    {"salesforce-api-context": "ok",
-                                     "metadata-experts": "inactive"})), \
+                                    {"metadata-experts": "inactive"})), \
                 mock.patch.object(sfx, "_read_health_sidecar",
                                   side_effect=self._fake_sidecars(
-                                      {"salesforce-api-context": "ok",
-                                       "metadata-experts": "ok"})):
+                                      {"metadata-experts": "ok"})):
             summary = sfx._live_mcp_summary(active_org="liveOrg")
         self.assertIn("NOT activated", summary)
         self.assertIn("metadata-experts", summary)
@@ -2524,8 +2530,7 @@ class McpHealthContractTests(unittest.TestCase):
                                 side_effect=self._fake_probes({})), \
                 mock.patch.object(sfx, "_read_health_sidecar",
                                   side_effect=self._fake_sidecars(
-                                      {"salesforce-api-context": "ok",
-                                       "metadata-experts": "ok"}, org="cachedOrg")):
+                                      {"metadata-experts": "ok"}, org="cachedOrg")):
             summary = sfx._live_mcp_summary(active_org="cachedOrg")
         self.assertIn("active", summary.lower())
 
@@ -2536,35 +2541,22 @@ class McpHealthContractTests(unittest.TestCase):
                                 side_effect=self._fake_probes({})), \
                 mock.patch.object(sfx, "_read_health_sidecar",
                                   side_effect=self._fake_sidecars(
-                                      {"salesforce-api-context": "ok",
-                                       "metadata-experts": "ok"}, org="otherOrg")):
+                                      {"metadata-experts": "ok"}, org="otherOrg")):
             summary = sfx._live_mcp_summary(active_org="thisOrg")
         self.assertIn("not yet observed", summary.lower())
         self.assertNotIn("active", summary.lower())
 
-    # --- partial: one tracked server healthy, one down (user-requested glyph) --
-    # A half-working feature is neither a full outage nor healthy: the summary
-    # reads "partial", names the down server, and the banner glyph is ⚠ partial —
-    # distinct from both ✓ connected (all ok) and ✗ unavailable (all down).
-    def test_summary_one_ok_one_inactive_is_partial(self):
-        summary = sfx._summarize_mcp_states(
-            {"salesforce-api-context": "ok", "metadata-experts": "inactive"})
-        self.assertIn("partial", summary.lower())
+    # --- a single tracked server that is down is a full outage, not "partial" ---
+    # `partial` needs one tracked server healthy and another down; with one required
+    # server that state is unreachable, so any bad state reads as unavailable.
+    def test_summary_single_inactive_is_unavailable_not_partial(self):
+        summary = sfx._summarize_mcp_states({"metadata-experts": "inactive"})
+        self.assertNotIn("partial", summary.lower())
         self.assertIn("metadata-experts", summary)  # names the down server
-        icon, style = sfx._mcp_indicator(summary)
-        self.assertIn("partial", icon)
-        self.assertNotIn("connected", icon)      # not a false green
-        self.assertNotIn("unavailable", icon)    # not a full outage either
+        self.assertIn("unavailable", sfx._mcp_indicator(summary)[0])
 
-    def test_summary_one_ok_one_auth_is_partial(self):
-        summary = sfx._summarize_mcp_states(
-            {"salesforce-api-context": "ok", "metadata-experts": "auth"})
-        self.assertIn("partial", summary.lower())
-        self.assertIn("partial", sfx._mcp_indicator(summary)[0])
-
-    def test_summary_both_inactive_is_full_unavailable_not_partial(self):
-        summary = sfx._summarize_mcp_states(
-            {"salesforce-api-context": "inactive", "metadata-experts": "inactive"})
+    def test_summary_single_auth_is_degraded_not_partial(self):
+        summary = sfx._summarize_mcp_states({"metadata-experts": "auth"})
         self.assertNotIn("partial", summary.lower())
         self.assertIn("unavailable", sfx._mcp_indicator(summary)[0])
 
@@ -2577,14 +2569,11 @@ class McpHealthContractTests(unittest.TestCase):
         self.assertIn("partial", icon)
         self.assertNotIn("connected", icon)
 
-    def test_live_summary_mixes_live_probe_with_sidecar_fallback(self):
-        # One server probes live (ok); the other's probe fails but its sidecar is
-        # a fresh inactive -> the inactive must still surface (worst-of).
-        def _one_probe(slug, timeout=None):
-            if slug == "salesforce-api-context":
-                return {"slug": slug, "state": "ok", "org": "liveOrg"}
-            return None  # metadata-experts probe could not run
-        with mock.patch.object(sfx, "_probe_server_raw", side_effect=_one_probe), \
+    def test_live_summary_unrunnable_probe_surfaces_inactive_sidecar(self):
+        # The probe could not run, but the last-known sidecar is a fresh inactive ->
+        # the inactive must still surface rather than being erased.
+        with mock.patch.object(sfx, "_probe_server_raw",
+                               side_effect=self._fake_probes({})), \
                 mock.patch.object(sfx, "_read_health_sidecar",
                                   side_effect=self._fake_sidecars(
                                       {"metadata-experts": "inactive"}, org="liveOrg")):
@@ -2608,7 +2597,7 @@ class McpHealthContractTests(unittest.TestCase):
         return sfx.render_banner_message(org, proj, stats, "", summary)
 
     def test_banner_icon_active_summary_is_connected_no_note(self):
-        out = self._banner_for("sf-mcp-proxy: api-context, metadata-experts active")
+        out = self._banner_for("sf-mcp-proxy: metadata-experts active")
         self.assertIn("✓ connected", out)
         self.assertNotIn("✗ unavailable", out)
         self.assertNotIn("Note:", out)
@@ -2638,14 +2627,13 @@ class McpHealthContractTests(unittest.TestCase):
     # reflects, so listing it beside the glyph misleads the viewer.
     def test_mcp_server_names_excludes_local_lsp(self):
         mcp_json = json.dumps({"mcpServers": {
-            "salesforce-api-context": {},
             "salesforce-lsp": {},
             "salesforce-metadata-experts": {},
         }})
         with mock.patch.object(Path, "read_text", return_value=mcp_json):
             names = sfx._mcp_server_names(Path("/plugin"))
-        self.assertIn("api-context", names)
         self.assertIn("metadata-experts", names)
+        self.assertNotIn("api-context", names)
         self.assertNotIn("lsp", names)
 
     def test_mcp_server_names_read_error_yields_empty(self):
@@ -2940,7 +2928,12 @@ class PluginMatchSensitivityPrecedenceTests(unittest.TestCase):
         return env
 
     def setUp(self):
-        patch = mock.patch.object(sfx, "_load_plugin_match_override", return_value=None)
+        for name in ("_load_plugin_match_override", "_load_plugin_match_project_override"):
+            patch = mock.patch.object(sfx, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        # Pin a Claude host so the userConfig tier is read regardless of ambient markers.
+        patch = mock.patch.object(sfx, "_plugin_state_host", return_value="claude")
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -2950,6 +2943,13 @@ class PluginMatchSensitivityPrecedenceTests(unittest.TestCase):
                 mock.patch.object(sfx, "_load_plugin_match_override", return_value="high"):
             self.assertEqual(
                 sfx._plugin_match_sensitivity_with_source(), ("off", "SF_DISABLE_PLUGIN_MATCH"))
+
+    def test_disable_env_var_wins_over_a_high_sensitivity_env_var(self):
+        with mock.patch.dict(sfx.os.environ, self._env(
+                SF_DISABLE_PLUGIN_MATCH="1", SF_PLUGIN_MATCH_SENSITIVITY="high"), clear=True):
+            self.assertEqual(
+                sfx._plugin_match_sensitivity_with_source(), ("off", "SF_DISABLE_PLUGIN_MATCH"))
+            self.assertEqual(sfx._plugin_match_sensitivity(), "off")
 
     def test_sensitivity_env_var_wins_over_persisted_and_option(self):
         with mock.patch.dict(sfx.os.environ, self._env(
@@ -2965,14 +2965,14 @@ class PluginMatchSensitivityPrecedenceTests(unittest.TestCase):
                 SF_PLUGIN_MATCH_SENSITIVITY="not-a-level"), clear=True), \
                 mock.patch.object(sfx, "_load_plugin_match_override", return_value="high"):
             self.assertEqual(
-                sfx._plugin_match_sensitivity_with_source(), ("high", "your saved preference"))
+                sfx._plugin_match_sensitivity_with_source(), ("high", "your saved preference for all projects"))
 
     def test_persisted_preference_wins_over_userconfig_option(self):
         with mock.patch.dict(sfx.os.environ, self._env(
                 CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY="high"), clear=True), \
                 mock.patch.object(sfx, "_load_plugin_match_override", return_value="low"):
             self.assertEqual(
-                sfx._plugin_match_sensitivity_with_source(), ("low", "your saved preference"))
+                sfx._plugin_match_sensitivity_with_source(), ("low", "your saved preference for all projects"))
 
     def test_userconfig_option_used_when_nothing_else_set(self):
         with mock.patch.dict(sfx.os.environ, self._env(
@@ -3041,6 +3041,670 @@ class PluginMatchOverridePersistenceTests(unittest.TestCase):
         (config_dir / "config.json").write_text(
             json.dumps({"sensitivity": "not-a-real-level"}), encoding="utf-8")
         self.assertIsNone(sfx._load_plugin_match_override())
+
+
+class PluginMatchConfigUpdateSafetyTests(unittest.TestCase):
+    """Preference updates preserve unreadable files and serialize all writers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        patch = mock.patch.object(sfx, "_PLUGIN_MATCH_CONFIG_DIR", self.root / "prefs")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.seed = {
+            "sensitivity": "low",
+            "projects": {
+                str(self.root / "a"): {"sensitivity": "off"},
+                str(self.root / "b"): {"sensitivity": "high"},
+            },
+        }
+        self.assertTrue(sfx._write_plugin_match_config(self.seed))
+        self.config = sfx._plugin_match_config_file()
+
+    def _assert_mutations_refused(self):
+        before = self.config.read_bytes()
+        self.assertFalse(sfx._save_plugin_match_override("off"))
+        self.assertFalse(sfx._save_plugin_match_project_override("standard", self.root / "c"))
+        self.assertFalse(sfx._clear_plugin_match_override())
+        self.assertEqual(sfx._clear_plugin_match_project_override(self.root / "a"), "error")
+        self.assertEqual(sfx._update_plugin_match_config(prune=True), "error")
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_hardlinked_config_is_preserved_by_every_mutation(self):
+        try:
+            os.link(self.config, self.root / "backup")
+        except OSError:
+            self.skipTest("hardlinks unavailable")
+        self._assert_mutations_refused()
+
+    def test_transient_read_failure_does_not_replace_or_remove_config(self):
+        with mock.patch.object(sfx, "_private_text", return_value=None):
+            self._assert_mutations_refused()
+
+    def test_oversized_config_is_preserved(self):
+        self.config.write_text(json.dumps({**self.seed, "padding": "x" * 65536}),
+                               encoding="ascii")
+        self._assert_mutations_refused()
+
+    def test_invalid_document_is_preserved_while_reads_still_fail_open(self):
+        for text in ("{bad json", "[]"):
+            with self.subTest(text=text):
+                self.config.write_text(text, encoding="ascii")
+                self.assertIsNone(sfx._read_plugin_match_config())
+                self._assert_mutations_refused()
+
+    def test_existing_unreadable_project_reset_reports_failure(self):
+        with mock.patch.object(sfx, "_private_text", return_value=None), \
+                redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()), \
+                mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as event:
+            self.assertEqual(sfx.cmd_plugin_match_config(["on", "--project"]), 1)
+            event.assert_not_called()
+
+    def test_lock_timeout_refuses_every_mutation(self):
+        lock = sfx._acquire_plugin_match_config_lock()
+        self.assertIsNotNone(lock)
+        try:
+            with mock.patch.object(sfx, "_PLUGIN_MATCH_CONFIG_LOCK_WAIT_SECONDS", 0.02):
+                self._assert_mutations_refused()
+        finally:
+            sfx._release_phase_history_lock(lock)
+        self.assertTrue(sfx._save_plugin_match_override("off"))
+
+    def test_lock_file_is_persistent_and_rejects_hardlinks(self):
+        self.assertTrue(sfx._save_plugin_match_override("off"))
+        lock_path = sfx._PLUGIN_MATCH_CONFIG_DIR / "config.lock"
+        inode = lock_path.stat().st_ino
+        self.assertTrue(sfx._clear_plugin_match_override())
+        self.assertEqual(lock_path.stat().st_ino, inode)
+        try:
+            os.link(lock_path, self.root / "lock-backup")
+        except OSError:
+            self.skipTest("hardlinks unavailable")
+        self._assert_mutations_refused()
+
+    def test_lock_is_exclusive_across_processes(self):
+        # Use a real second process so an in-process mutex cannot pass this proof.
+        import subprocess
+        code = (
+            "import sys; from pathlib import Path; "
+            "sys.path.insert(0, sys.argv[1]); import sf_context as s; "
+            "s._PLUGIN_MATCH_CONFIG_DIR=Path(sys.argv[2]); "
+            "s._PLUGIN_MATCH_CONFIG_LOCK_WAIT_SECONDS=0.02; "
+            "sys.exit(0 if s._save_plugin_match_override('off') else 3)"
+        )
+        args = [sys.executable, "-c", code, str(_MODULE_PATH.parent),
+                str(sfx._PLUGIN_MATCH_CONFIG_DIR)]
+        lock = sfx._acquire_plugin_match_config_lock()
+        self.assertIsNotNone(lock)
+        try:
+            result = subprocess.run(args, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(sfx._read_plugin_match_config(), self.seed)
+        finally:
+            sfx._release_phase_history_lock(lock)
+        result = subprocess.run(args, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_overlapping_save_and_reset_preserve_unrelated_changes(self):
+        for operation in ("project-save", "global-save", "project-reset", "global-reset"):
+            with self.subTest(operation=operation):
+                self.assertTrue(sfx._write_plugin_match_config(self.seed))
+                read_started = threading.Event()
+                release_read = threading.Event()
+                second_lock_attempt = threading.Event()
+                read = sfx._read_plugin_match_config
+                acquire = sfx._acquire_plugin_match_config_lock
+                results = {}
+
+                def paused_read(**kwargs):
+                    data = read(**kwargs)
+                    if threading.current_thread().name == "first-save":
+                        read_started.set()
+                        if not release_read.wait(5):
+                            raise OSError("test reader timed out")
+                    return data
+
+                def tracked_acquire():
+                    if threading.current_thread().name == "second-update":
+                        second_lock_attempt.set()
+                    return acquire()
+
+                def first():
+                    results["first"] = sfx._save_plugin_match_project_override(
+                        "standard", self.root / "c")
+
+                def second():
+                    if operation == "project-save":
+                        result = sfx._save_plugin_match_project_override("low", self.root / "d")
+                    elif operation == "global-save":
+                        result = sfx._save_plugin_match_override("off")
+                    elif operation == "project-reset":
+                        result = sfx._clear_plugin_match_project_override(self.root / "a")
+                    else:
+                        result = sfx._clear_plugin_match_override()
+                    results["second"] = result
+
+                with mock.patch.object(sfx, "_read_plugin_match_config", side_effect=paused_read), \
+                        mock.patch.object(sfx, "_acquire_plugin_match_config_lock",
+                                          side_effect=tracked_acquire):
+                    a = threading.Thread(target=first, name="first-save")
+                    b = threading.Thread(target=second, name="second-update")
+                    a.start()
+                    try:
+                        self.assertTrue(read_started.wait(5))
+                        b.start()
+                        self.assertTrue(second_lock_attempt.wait(5))
+                    finally:
+                        release_read.set()
+                        a.join(5)
+                        if b.ident is not None:
+                            b.join(5)
+                    self.assertFalse(a.is_alive())
+                    self.assertFalse(b.is_alive())
+                self.assertTrue(results["first"])
+                self.assertEqual(results["second"], "removed" if operation == "project-reset" else True)
+                data = read()
+                expected = json.loads(json.dumps(self.seed))
+                expected["projects"][str(self.root / "c")] = {"sensitivity": "standard"}
+                if operation == "project-save":
+                    expected["projects"][str(self.root / "d")] = {"sensitivity": "low"}
+                elif operation == "global-save":
+                    expected["sensitivity"] = "off"
+                elif operation == "project-reset":
+                    expected["projects"].pop(str(self.root / "a"))
+                else:
+                    expected.pop("sensitivity")
+                self.assertEqual(data, expected)
+
+
+_HOST_MARKER_KEYS = HOST_MARKER_KEYS
+
+
+class PluginMatchConfigCapacityTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.active = self.root / "active"
+        self.active.mkdir()
+        self.missing = self.root / "old-project"
+        patch = mock.patch.object(sfx, "_PLUGIN_MATCH_CONFIG_DIR", self.root / "prefs")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.seed = {"projects": {
+            str(self.active): {"sensitivity": "high"},
+            str(self.missing): {"sensitivity": "off"},
+        }}
+
+    def _run(self, *args):
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err, \
+                mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as event:
+            rc = sfx.cmd_plugin_match_config(list(args))
+        return rc, out.getvalue(), err.getvalue(), event
+
+    def test_full_store_reports_capacity_and_explicit_cleanup_recovers(self):
+        self.seed["padding"] = ""
+        size = len(json.dumps(self.seed, separators=(",", ":")).encode("utf-8"))
+        self.seed["padding"] = "x" * (sfx._PLUGIN_MATCH_CONFIG_MAX_BYTES - size - 8)
+        self.assertTrue(sfx._write_plugin_match_config(self.seed))
+        before = sfx._plugin_match_config_file().read_bytes()
+        with mock.patch.dict(os.environ, {"SF_AGENT_CLIENT": "codex"}):
+            rc, out, err, event = self._run("off")
+        self.assertEqual(rc, 1)
+        self.assertIn("64 KiB limit", err)
+        self.assertIn("prune", err)
+        self.assertNotIn("sandbox most likely blocked", err)
+        self.assertEqual(sfx._plugin_match_config_file().read_bytes(), before)
+        event.assert_not_called()
+
+        rc, out, err, event = self._run("prune")
+        self.assertEqual(rc, 0, err)
+        event.assert_called_once_with("reset", "default")
+        data = sfx._read_plugin_match_config()
+        self.assertEqual(data["projects"], {str(self.active): {"sensitivity": "high"}})
+        self.assertEqual(data["padding"], self.seed["padding"])
+        self.assertEqual(self._run("off")[0], 0)
+
+    def test_prune_preserves_global_value_existing_projects_and_inaccessible_paths(self):
+        self.seed["sensitivity"] = "low"
+        invalid = {"relative-path": {"sensitivity": "off"},
+                   "/invalid\0path": {"sensitivity": "high"}}
+        self.seed["projects"].update(invalid)
+        self.assertTrue(sfx._write_plugin_match_config(self.seed))
+        original_stat = Path.stat
+
+        def inaccessible(path, *args, **kwargs):
+            if path == self.missing:
+                raise PermissionError("unavailable project")
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=inaccessible):
+            rc, out, err, event = self._run("prune")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Nothing was changed", out)
+        event.assert_not_called()
+        self.assertEqual(sfx._read_plugin_match_config(), self.seed)
+        self.assertEqual(self._run("prune")[0], 0)
+        self.assertEqual(sfx._read_plugin_match_config(), {
+            "sensitivity": "low", "projects": {
+                str(self.active): {"sensitivity": "high"}, **invalid}})
+
+    def test_prune_rejects_scope_and_extra_arguments(self):
+        self.assertTrue(sfx._write_plugin_match_config(self.seed))
+        for args in (("prune", "--project"), ("prune", "extra")):
+            with self.subTest(args=args):
+                self.assertEqual(self._run(*args)[0], 2)
+                self.assertEqual(sfx._read_plugin_match_config(), self.seed)
+
+    def test_prune_without_a_config_is_a_read_only_noop(self):
+        rc, out, err, event = self._run("prune")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Nothing was changed", out)
+        self.assertFalse(sfx._plugin_match_config_file().exists())
+        event.assert_not_called()
+
+
+class PluginHostInferenceTests(unittest.TestCase):
+    """W-24599110: with SF_AGENT_CLIENT unset the host is inferred from agent
+    markers; no marker at all keeps the legacy Claude default, and conflicting
+    markers make install state unknown (never read Claude's settings)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "home"
+        self.home.mkdir()
+        env = {k: v for k, v in sfx.os.environ.items() if k not in _HOST_MARKER_KEYS}
+        env["HOME"] = str(self.home)
+        for patch in (
+            mock.patch.dict(sfx.os.environ, env, clear=True),
+            # A --plugin-dir style root under neither host's plugin cache.
+            mock.patch.object(sfx, "_plugin_root",
+                              return_value=str(Path(self._tmp.name) / "worktree-plugin")),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _claude_settings(self, enabled):
+        config = self.home / ".claude"
+        config.mkdir(exist_ok=True)
+        (config / "settings.json").write_text(
+            json.dumps({"enabledPlugins": enabled}), encoding="utf-8")
+
+    def test_no_markers_keeps_the_claude_default(self):
+        self.assertEqual(sfx._inferred_plugin_host(), "claude")
+        self.assertEqual(sfx._plugin_client(), "claude")
+        self.assertEqual(sfx._plugin_state_host(), "claude")
+
+    def test_no_markers_still_reads_claude_settings(self):
+        self._claude_settings({"agentforce-adlc@salesforce": True})
+        self.assertEqual(sfx._enabled_plugin_names(), {"agentforce-adlc"})
+
+    def test_claude_markers_select_claude(self):
+        for name, value in (("CLAUDE_CODE_SESSION_ID", "s1"), ("CLAUDECODE", "1"),
+                            ("CLAUDE_CODE_CHILD_SESSION", "1")):
+            with self.subTest(marker=name), mock.patch.dict(sfx.os.environ, {name: value}):
+                self.assertEqual(sfx._plugin_client(), "claude")
+                self.assertEqual(sfx._plugin_state_host(), "claude")
+
+    def test_codex_home_alone_is_codex_but_yields_to_a_claude_marker(self):
+        with mock.patch.dict(sfx.os.environ, {"CODEX_HOME": str(self.home / ".codex")}):
+            self.assertEqual(sfx._plugin_client(), "codex")
+            with mock.patch.dict(sfx.os.environ, {"CLAUDECODE": "1"}):
+                self.assertEqual(sfx._plugin_client(), "claude")
+                self.assertEqual(sfx._plugin_state_host(), "claude")
+
+    def test_conflicting_markers_make_install_state_unknown(self):
+        self._claude_settings({"agentforce-adlc@salesforce": True})
+        with mock.patch.dict(sfx.os.environ, {
+                "CODEX_THREAD_ID": "thread-1", "CLAUDE_CODE_SESSION_ID": "s1"}):
+            self.assertEqual(sfx._inferred_plugin_host(), "unknown")
+            # Conflicting markers: both the host and install state are unknown.
+            self.assertEqual(sfx._plugin_client(), "unknown")
+            self.assertEqual(sfx._plugin_state_host(), "unknown")
+            self.assertEqual(sfx._plugin_state_host("claude"), "unknown")
+            self.assertIsNone(sfx._enabled_plugin_names())
+            self.assertIsNone(sfx._enabled_plugin_names("claude"))
+
+    def test_explicit_client_env_still_wins_for_presentation(self):
+        with mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": "codex"}):
+            self.assertEqual(sfx._plugin_client(), "codex")
+            self.assertEqual(sfx._plugin_state_host(), "codex")
+        with mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": "claude"}):
+            self.assertEqual(sfx._plugin_client(), "claude")
+            self.assertEqual(sfx._plugin_state_host(), "claude")
+
+    def test_conflicting_explicit_selectors_never_read_either_inventory(self):
+        for requested, env_client in (("claude", "codex"), ("codex", "claude")):
+            with self.subTest(requested=requested), \
+                    mock.patch.dict(os.environ, {"SF_AGENT_CLIENT": env_client}), \
+                    mock.patch.object(Path, "read_text", side_effect=AssertionError("read inventory")), \
+                    mock.patch.object(sfx.subprocess, "run", side_effect=AssertionError("ran inventory")):
+                self.assertEqual(sfx._plugin_state_host(requested), "unknown")
+                self.assertIsNone(sfx._enabled_plugin_names(requested))
+                # The presentation selector remains explicit; only state is unknown.
+                self.assertEqual(sfx._plugin_client(requested), requested)
+
+    def test_repeated_host_detection_avoids_path_resolution_but_tracks_new_markers(self):
+        original_resolve = Path.resolve
+        with mock.patch.object(Path, "resolve", autospec=True, side_effect=original_resolve) as resolve:
+            self.assertEqual(sfx._inferred_plugin_host(), "claude")
+            first = resolve.call_count
+            self.assertGreater(first, 0)
+            self.assertEqual(sfx._inferred_plugin_host(), "claude")
+            self.assertEqual(resolve.call_count, first)
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-new"}):
+                self.assertEqual(sfx._inferred_plugin_host(), "codex")
+                self.assertEqual(resolve.call_count, first)
+                with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+                    self.assertEqual(sfx._inferred_plugin_host(), "unknown")
+
+    def test_relative_config_path_cache_tracks_working_directory(self):
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        with mock.patch.object(sfx, "_plugin_root", return_value=str(self.home / "plugins")):
+            os.chdir(self.home)
+            self.assertTrue(sfx._plugin_root_under(Path("plugins")))
+            os.chdir(self.home.parent)
+            self.assertFalse(sfx._plugin_root_under(Path("plugins")))
+
+    def test_relative_config_path_with_an_unavailable_cwd_fails_open(self):
+        with mock.patch.object(sfx.os, "getcwd", side_effect=OSError("cwd unavailable")):
+            self.assertFalse(sfx._plugin_root_under(Path("plugins")))
+
+
+class PluginMatchProjectPreferenceTests(unittest.TestCase):
+    """W-24599110: a per-project preference keyed by the stable project root in
+    the shared ~/.sf/plugin-recommendations/config.json, above the all-projects
+    value and below the env vars; old all-projects-only files keep working."""
+
+    _ENV_KEYS = (
+        "SF_DISABLE_PLUGIN_MATCH", "SF_PLUGIN_MATCH_SENSITIVITY",
+        "CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY",
+    ) + _HOST_MARKER_KEYS
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name).resolve()
+        self.home = root / "home"
+        self.home.mkdir()
+        self.project_a = root / "project-a"
+        self.project_b = root / "project-b"
+        for project in (self.project_a, self.project_b):
+            (project / "force-app").mkdir(parents=True)
+            (project / "sfdx-project.json").write_text("{}", encoding="utf-8")
+        env = {k: v for k, v in sfx.os.environ.items() if k not in self._ENV_KEYS}
+        env["HOME"] = str(self.home)
+        self.config_dir = self.home / ".sf" / "plugin-recommendations"
+        for patch in (
+            mock.patch.dict(sfx.os.environ, env, clear=True),
+            mock.patch.object(sfx, "_PLUGIN_MATCH_CONFIG_DIR", self.config_dir),
+            mock.patch.object(sfx, "_plugin_root",
+                              return_value=str(root / "worktree-plugin")),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self._cwd = Path.cwd()
+        self.addCleanup(os.chdir, self._cwd)
+        os.chdir(self.project_a / "force-app")   # below the root: key is still the root
+
+    def _run(self, *args):
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured"), \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_match_config(list(args))
+        return rc, out.getvalue()
+
+    def _config(self):
+        return json.loads((self.config_dir / "config.json").read_text(encoding="utf-8"))
+
+    def test_project_value_is_keyed_by_the_stable_project_root(self):
+        rc, out = self._run("--project", "set", "high")
+        self.assertEqual(rc, 0)
+        self.assertIn(str(self.project_a), out)
+        self.assertEqual(self._config(), {
+            "projects": {str(self.project_a): {"sensitivity": "high"}}})
+
+    def test_precedence_uses_one_fresh_document_per_resolution(self):
+        self._run("set", "low")
+        with mock.patch.object(sfx, "_read_plugin_match_config",
+                               wraps=sfx._read_plugin_match_config) as read:
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+            read.assert_called_once_with()
+        self._run("--project", "set", "high")
+        with mock.patch.object(sfx, "_read_plugin_match_config",
+                               wraps=sfx._read_plugin_match_config) as read:
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("high", sfx._PLUGIN_MATCH_SOURCE_PROJECT))
+            read.assert_called_once_with()
+
+    def test_project_value_wins_over_all_projects_value_and_userconfig(self):
+        self._run("set", "low")
+        self._run("set", "--project", "high")
+        with mock.patch.dict(sfx.os.environ, {
+                "CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY": "off"}):
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("high", sfx._PLUGIN_MATCH_SOURCE_PROJECT))
+
+    def test_env_vars_still_win_over_the_project_value(self):
+        self._run("--project", "set", "high")
+        with mock.patch.dict(sfx.os.environ, {"SF_PLUGIN_MATCH_SENSITIVITY": "low"}):
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("low", "SF_PLUGIN_MATCH_SENSITIVITY"))
+        with mock.patch.dict(sfx.os.environ, {"SF_DISABLE_PLUGIN_MATCH": "1"}):
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("off", "SF_DISABLE_PLUGIN_MATCH"))
+
+    def test_other_project_falls_back_to_the_all_projects_value(self):
+        self._run("set", "low")
+        self._run("--project", "off")
+        os.chdir(self.project_b)
+        self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                         ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+
+    def test_all_projects_change_keeps_project_values_and_notes_them(self):
+        self._run("--project", "set", "high")
+        rc, out = self._run("set", "low")
+        self.assertEqual(rc, 0)
+        self.assertIn("this project has its own saved setting (high)", out)
+        rc, out = self._run("on")
+        self.assertEqual(rc, 0)
+        self.assertIn("on --project", out)
+        self.assertEqual(self._config(), {
+            "projects": {str(self.project_a): {"sensitivity": "high"}}})
+
+    def test_project_on_removes_only_this_project_value(self):
+        self._run("set", "low")
+        self._run("--project", "set", "high")
+        os.chdir(self.project_b)
+        self._run("--project", "set", "4.5")
+        os.chdir(self.project_a)
+        rc, _ = self._run("on", "--project")
+        self.assertEqual(rc, 0)
+        self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                         ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+        self.assertEqual(self._config()["projects"],
+                         {str(self.project_b): {"sensitivity": 4.5}})
+
+    def test_symlinked_project_root_shares_the_real_path_entry(self):
+        link = self.home.parent / "project-a-link"
+        try:
+            link.symlink_to(self.project_a, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.assertEqual(sfx._plugin_match_project_key(link), str(self.project_a))
+        self.assertEqual(sfx._plugin_match_project_key(link / "force-app"),
+                         str(self.project_a))
+        # Saved via the symlink, read via the real path.
+        self.assertTrue(sfx._save_plugin_match_project_override("high", link))
+        self.assertEqual(sfx._load_plugin_match_project_override(self.project_a), "high")
+        self.assertEqual(self._config(), {
+            "projects": {str(self.project_a): {"sensitivity": "high"}}})
+        # Saved via the real path, read via the symlink: same single entry.
+        self.assertTrue(sfx._save_plugin_match_project_override("low", self.project_a))
+        self.assertEqual(sfx._load_plugin_match_project_override(link), "low")
+        self.assertEqual(list(self._config()["projects"]), [str(self.project_a)])
+
+    def test_project_on_without_a_saved_entry_changes_nothing(self):
+        self._run("set", "low")   # all-projects value only; no project entry
+        before = (self.config_dir / "config.json").read_bytes()
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as fired, \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_match_config(["on", "--project"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no saved setting", out.getvalue())
+        self.assertIn("Nothing was changed", out.getvalue())
+        self.assertNotIn("removed", out.getvalue())
+        fired.assert_not_called()
+        self.assertEqual((self.config_dir / "config.json").read_bytes(), before)
+        self.assertEqual(sfx._clear_plugin_match_project_override(), "unset")
+
+    def test_project_on_without_any_config_file_changes_nothing(self):
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as fired, \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_match_config(["--project", "on"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Nothing was changed", out.getvalue())
+        fired.assert_not_called()
+        self.assertFalse((self.config_dir / "config.json").exists())
+
+    def test_project_on_with_a_saved_entry_removes_it_and_fires_reset_once(self):
+        self._run("--project", "set", "high")
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured") as fired, \
+                redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_match_config(["on", "--project"])
+        self.assertEqual(rc, 0)
+        self.assertIn("saved setting was removed", out.getvalue())
+        fired.assert_called_once_with("reset", "default")
+        self.assertFalse((self.config_dir / "config.json").exists())
+
+    def test_clearing_the_last_value_removes_the_file(self):
+        self._run("--project", "set", "high")
+        self._run("--project", "on")
+        self.assertFalse((self.config_dir / "config.json").exists())
+
+    def test_legacy_all_projects_file_is_read_and_preserved(self):
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "config.json").write_text('{"sensitivity":"low"}', encoding="ascii")
+        self.config_dir.chmod(0o700)
+        (self.config_dir / "config.json").chmod(0o600)
+        self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                         ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+        self._run("--project", "set", "high")
+        self.assertEqual(self._config()["sensitivity"], "low")
+
+    def test_status_names_the_project_tier_and_root(self):
+        self._run("--project", "set", "high")
+        rc, out = self._run("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("Source:  your saved preference for this project", out)
+        self.assertIn(f"Project: {self.project_a}", out)
+
+    def test_malformed_project_entry_falls_through(self):
+        self.config_dir.mkdir(parents=True, mode=0o700)
+        (self.config_dir / "config.json").write_text(json.dumps({
+            "sensitivity": "low",
+            "projects": {str(self.project_a): {"sensitivity": "extreme"}}}), encoding="ascii")
+        (self.config_dir / "config.json").chmod(0o600)
+        self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                         ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+
+    def test_saved_preference_is_shared_by_claude_and_codex(self):
+        self._run("--project", "set", "high")
+        for markers in ({"CLAUDE_CODE_SESSION_ID": "s1"}, {"CODEX_THREAD_ID": "thread-1"},
+                        {"SF_AGENT_CLIENT": "codex"}):
+            with self.subTest(markers=markers), mock.patch.dict(sfx.os.environ, markers):
+                self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                                 ("high", sfx._PLUGIN_MATCH_SOURCE_PROJECT))
+
+    def test_userconfig_default_is_not_read_under_codex(self):
+        with mock.patch.dict(sfx.os.environ, {
+                "CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY": "off"}):
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("off", "plugin default (userConfig)"))
+            with mock.patch.dict(sfx.os.environ, {"CODEX_THREAD_ID": "thread-1"}):
+                self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                                 ("standard", "built-in default"))
+
+    def test_codex_resolves_full_tier_ladder_and_never_the_claude_default(self):
+        # The Claude userConfig default has no Codex source. With it
+        # set, Codex walks env > project > all-projects > standard and never
+        # reports "plugin default (userConfig)".
+        self._run("set", "low")
+        self._run("--project", "set", "high")
+        env = {"CODEX_THREAD_ID": "thread-1",
+               "CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY": "off"}
+        with mock.patch.dict(sfx.os.environ, env):
+            self.assertEqual(sfx._plugin_state_host(), "codex")
+            with mock.patch.dict(sfx.os.environ, {"SF_PLUGIN_MATCH_SENSITIVITY": "7.5"}):
+                self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                                 (7.5, "SF_PLUGIN_MATCH_SENSITIVITY"))
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("high", sfx._PLUGIN_MATCH_SOURCE_PROJECT))
+            self._run("--project", "on")
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+            self._run("on")
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("standard", "built-in default"))
+
+    def test_codex_invalid_env_sensitivity_falls_through_silently(self):
+        # An unparseable SF_PLUGIN_MATCH_SENSITIVITY is ignored under
+        # Codex: next tier wins, no exception, no stderr.
+        self._run("set", "low")
+        for bad in ("extreme", "0.5", "11", ""):
+            env = {"CODEX_THREAD_ID": "thread-1", "SF_PLUGIN_MATCH_SENSITIVITY": bad}
+            with self.subTest(value=bad), mock.patch.dict(sfx.os.environ, env), \
+                    redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(sfx._plugin_state_host(), "codex")
+                self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                                 ("low", sfx._PLUGIN_MATCH_SOURCE_USER))
+                self.assertEqual(err.getvalue(), "")
+
+    def test_userconfig_default_is_not_read_under_an_unclear_host(self):
+        # Claude and Codex markers both present: the state host is "unknown", and
+        # the Claude-only install default must not leak into a possible Codex run.
+        with mock.patch.dict(sfx.os.environ, {
+                "CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY": "off",
+                "CLAUDE_CODE_SESSION_ID": "s1", "CODEX_THREAD_ID": "thread-1"}):
+            self.assertEqual(sfx._plugin_state_host(), "unknown")
+            self.assertEqual(sfx._plugin_match_sensitivity_with_source(),
+                             ("standard", "built-in default"))
+
+    def _run_failed_write(self, *args):
+        with mock.patch.object(sfx, "_fire_plugin_recommendation_configured"), \
+                mock.patch.object(sfx, "_write_plugin_match_config", return_value=False), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = sfx.cmd_plugin_match_config(list(args))
+        return rc, err.getvalue()
+
+    def test_codex_write_failure_asks_for_escalation_not_a_retry(self):
+        # A sandboxed Codex shell cannot write ~/.sf, so "try again in a moment"
+        # fails the same way; the message names the sandbox and asks for escalation.
+        self.assertEqual(self._run("--project", "set", "low")[0], 0)
+        with mock.patch.dict(sfx.os.environ, {"CODEX_THREAD_ID": "thread-1"}):
+            for args in (("--project", "set", "high"), ("set", "high"),
+                         ("--project", "off"), ("off",), ("--project", "on"), ("on",)):
+                with self.subTest(args=args):
+                    rc, err = self._run_failed_write(*args)
+                    self.assertEqual(rc, 1)
+                    self.assertIn("Codex sandbox most likely blocked", err)
+                    self.assertIn(str(self.config_dir / "config.json"), err)
+                    self.assertIn('sandbox_permissions="require_escalated"', err)
+                    self.assertNotIn("Try again in a moment", err)
+            self.assertIn("SF_DISABLE_PLUGIN_MATCH=1", self._run_failed_write("off")[1])
+
+    def test_claude_write_failure_keeps_the_retry_hint(self):
+        with mock.patch.dict(sfx.os.environ, {"CLAUDE_CODE_SESSION_ID": "s1"}):
+            rc, err = self._run_failed_write("--project", "set", "high")
+            self.assertEqual(rc, 1)
+            self.assertIn("busy or unwritable). Try again in a moment.", err)
+            self.assertNotIn("require_escalated", err)
+            self.assertIn("Try again in a moment. Or set SF_DISABLE_PLUGIN_MATCH=1",
+                          self._run_failed_write("off")[1])
 
 
 class CmdPluginMatchConfigTests(unittest.TestCase):
@@ -6854,6 +7518,269 @@ class PluginInstallMarketplaceRoutingTests(unittest.TestCase):
             ["claude", "plugin", "marketplace", "add", "forcedotcom/sf-skills"],
             ["claude", "plugin", "marketplace", "update", "salesforce"],
         ])
+
+
+class PluginInstallUnknownHostTests(unittest.TestCase):
+    """W-24599110: an unclear host (conflicting Claude/Codex markers, or an
+    explicit --client that a strong marker contradicts) refuses install with
+    manual commands for both hosts and never runs a host command."""
+
+    NAME = "experience-react"
+    CSID = "codex:sess-unknown"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = {k: v for k, v in sfx.os.environ.items() if k not in _HOST_MARKER_KEYS}
+        env["HOME"] = str(Path(self._tmp.name) / "home")
+        self.entry = {"source": f"./plugins/builder/{self.NAME}", "origin": "local"}
+        self.result = mock.patch.object(sfx, "_fire_plugin_install_result").start()
+        self.run_step = mock.patch.object(sfx, "_run_plugin_install_step").start()
+        self.register = mock.patch.object(
+            sfx, "_ensure_salesforce_marketplace_registered").start()
+        self.subproc = mock.patch.object(sfx.subprocess, "run").start()
+        self.perform = mock.patch.object(sfx, "_perform_plugin_install").start()
+        mock.patch.object(
+            sfx, "_plugin_install_lookup", return_value=_plugin_lookup(self.entry)).start()
+        mock.patch.object(sfx, "_PLUGIN_PROPOSAL_DIR", Path(self._tmp.name) / "p").start()
+        mock.patch.object(sfx, "_PLUGIN_INSTALL_PENDING_DIR", Path(self._tmp.name) / "i").start()
+        mock.patch.object(sfx, "_PLUGIN_FLOW_DIR", Path(self._tmp.name) / "f").start()
+        mock.patch.dict(sfx.os.environ, env, clear=True).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _conflict(self):
+        return mock.patch.dict(sfx.os.environ, {
+            "CODEX_THREAD_ID": "thread-1", "CLAUDECODE": "1"})
+
+    def _install(self, *args):
+        with redirect_stderr(io.StringIO()) as stderr, redirect_stdout(io.StringIO()) as out:
+            rc = sfx.cmd_plugin_install([self.NAME, *args, "--session-id", "sess-unknown"])
+        return rc, stderr.getvalue(), out.getvalue()
+
+    def _assert_refused(self, rc, err, out, sid="sess-unknown"):
+        self.assertEqual(rc, 2)
+        self.assertEqual(err, "")
+        for cmd in (
+                f"claude plugin marketplace add {sfx._SALESFORCE_MARKETPLACE_REPO}",
+                f"claude plugin install {self.NAME}@salesforce",
+                f"codex plugin marketplace add {sfx._SALESFORCE_MARKETPLACE_REPO}",
+                f"codex plugin add {self.NAME}@salesforce"):
+            self.assertIn(cmd, out)
+        self.assertIn(
+            "Show these commands to the user; the user runs the one for the agent they "
+            "are using. Do not retry plugin-install, and do not set SF_AGENT_CLIENT or "
+            "--client to override the host.", out)
+        self.assertNotIn("SF_AGENT_CLIENT=claude or SF_AGENT_CLIENT=codex and retry", out)
+        self.run_step.assert_not_called()
+        self.subproc.assert_not_called()
+        self.register.assert_not_called()
+        self.perform.assert_not_called()
+        self.result.assert_called_once_with("host_unclear", sid, self.NAME)
+        self.assertIsNone(sfx._load_plugin_install_pending(sid))
+
+    def _select_proposal(self, sid="sess-unknown"):
+        # Codex sessions live in a "codex:"-prefixed namespace (_plugin_session_id).
+        self.assertTrue(sfx._save_plugin_proposals(
+            sid, {self.NAME: {"confidence": "high", "surface": "user-prompt"}}))
+        self.assertTrue(sfx._save_plugin_flow(
+            sid, [self.NAME], selected=self.NAME, state="selected",
+            surface="user-prompt", task_backed=True))
+
+    def test_conflicting_markers_refuse_bare_call(self):
+        with self._conflict():
+            rc, err, out = self._install()
+        self._assert_refused(rc, err, out)
+        self.assertIn("host agent is unclear (Claude Code and Codex markers conflict)", out)
+
+    def test_conflicting_markers_refuse_accept_proposed(self):
+        self._select_proposal()
+        with self._conflict():
+            rc, err, out = self._install("--accept-proposed")
+        self._assert_refused(rc, err, out)
+
+    def test_conflicting_markers_refuse_confirm_with_a_valid_nonce(self):
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        with self._conflict():
+            rc, err, out = self._install("--confirm", nonce)
+        self._assert_refused(rc, err, out)
+
+    def test_conflicting_markers_with_env_claude_selector_refuse(self):
+        with self._conflict(), mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": "claude"}):
+            rc, err, out = self._install()
+        self._assert_refused(rc, err, out)
+
+    def test_conflicting_markers_with_env_claude_selector_refuse_accept_proposed(self):
+        self._select_proposal()
+        with self._conflict(), mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": "claude"}):
+            rc, err, out = self._install("--accept-proposed")
+        self._assert_refused(rc, err, out)
+
+    def test_explicit_claude_client_with_a_codex_marker_refuses(self):
+        with mock.patch.dict(sfx.os.environ, {"CODEX_THREAD_ID": "thread-1"}):
+            rc, err, out = self._install("--client", "claude")
+        self._assert_refused(rc, err, out)
+        self.assertIn(
+            "host agent is unclear (a Claude Code selection is contradicted by a Codex marker)",
+            out)
+
+    def _disagree(self, env_client):
+        return mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": env_client})
+
+    def test_env_codex_with_client_claude_refuses_bare_call(self):
+        with self._disagree("codex"):
+            rc, err, out = self._install("--client", "claude")
+        self._assert_refused(rc, err, out)
+        self.assertIn(
+            "host agent is unclear (--client and SF_AGENT_CLIENT name different agents)", out)
+        self.assertNotIn("markers conflict", out)
+        self.assertNotIn("--confirm", out)
+
+    def test_env_codex_with_client_claude_refuses_accept_proposed(self):
+        self._select_proposal()
+        with self._disagree("codex"):
+            rc, err, out = self._install("--accept-proposed", "--client", "claude")
+        self._assert_refused(rc, err, out)
+
+    def test_env_codex_with_client_claude_refuses_confirm_with_valid_nonce(self):
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        with self._disagree("codex"):
+            rc, err, out = self._install("--confirm", nonce, "--client", "claude")
+        self._assert_refused(rc, err, out)
+
+    def test_env_claude_with_client_codex_refuses_bare_call(self):
+        with self._disagree("claude"):
+            rc, err, out = self._install("--client", "codex")
+        self._assert_refused(rc, err, out, self.CSID)
+        self.assertNotIn("--confirm", out)
+
+    def test_env_claude_with_client_codex_refuses_accept_proposed(self):
+        self._select_proposal(self.CSID)
+        with self._disagree("claude"):
+            rc, err, out = self._install("--accept-proposed", "--client", "codex")
+        self._assert_refused(rc, err, out, self.CSID)
+
+    def test_env_claude_with_client_codex_refuses_confirm_with_valid_nonce(self):
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        with self._disagree("claude"):
+            rc, err, out = self._install("--confirm", nonce, "--client", "codex")
+        self._assert_refused(rc, err, out, self.CSID)
+
+    def test_disagreeing_selectors_normalize_case_and_whitespace(self):
+        with self._disagree("  CoDeX "):
+            rc, err, out = self._install("--client", "claude")
+        self._assert_refused(rc, err, out)
+
+    def test_disagreeing_selectors_still_allow_decline(self):
+        with self._disagree("codex"), \
+                mock.patch.object(sfx, "_cmd_plugin_install_decline", return_value=0) as decline:
+            rc, _err, _out = self._install("--decline", "--client", "claude")
+        self.assertEqual(rc, 0)
+        decline.assert_called_once()
+        self.result.assert_not_called()
+
+    def test_agreeing_codex_selectors_preview_not_host_unclear(self):
+        with self._disagree("codex"):
+            rc, err, out = self._install("--client", "codex")
+        self._assert_codex_conflict_previews(rc, err, out)
+
+    def test_agreeing_claude_selectors_preview_not_host_unclear(self):
+        with self._disagree("claude"):
+            rc, err, out = self._install("--client", "claude")
+        self.assertEqual(rc, 0, (err, out))
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        self.assertIn(nonce, out)
+        self.result.assert_called_once_with("previewed", "sess-unknown", self.NAME)
+        self.assertIsNotNone(sfx._load_plugin_install_pending("sess-unknown"))
+        self.perform.assert_not_called()
+        self.run_step.assert_not_called()
+        self.subproc.assert_not_called()
+
+    def test_agreeing_claude_selectors_confirm_installs(self):
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        self.perform.return_value = 0
+        with self._disagree("claude"):
+            rc, err, out = self._install("--confirm", nonce, "--client", "claude")
+        self.assertEqual(rc, 0, (err, out))
+        self.perform.assert_called_once()
+        for call in self.result.call_args_list:
+            self.assertNotEqual(call.args[0], "host_unclear")
+
+    def _assert_codex_conflict_previews(self, rc, err, out):
+        self.assertEqual(rc, 0, (err, out))
+        nonce = sfx._plugin_install_nonce(self.NAME, self.entry)
+        self.assertIn(f"--confirm {nonce} --client codex", out)
+        self.perform.assert_not_called()
+        self.run_step.assert_not_called()
+        self.subproc.assert_not_called()
+        self.result.assert_called_once_with("previewed", self.CSID, self.NAME)
+        pending = sfx._load_plugin_install_pending(self.CSID)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["nonce"], nonce)
+        return nonce
+
+    def test_conflicting_markers_codex_client_accept_proposed_previews_not_installs(self):
+        self._select_proposal(self.CSID)
+        with self._conflict():
+            rc, err, out = self._install("--accept-proposed", "--client", "codex")
+        self._assert_codex_conflict_previews(rc, err, out)
+
+    def test_conflicting_markers_codex_env_accept_proposed_previews_not_installs(self):
+        self._select_proposal(self.CSID)
+        with self._conflict(), mock.patch.dict(sfx.os.environ, {"SF_AGENT_CLIENT": "codex"}):
+            rc, err, out = self._install("--accept-proposed")
+        self._assert_codex_conflict_previews(rc, err, out)
+
+    def test_conflicting_markers_codex_confirm_without_user_reply_is_refused(self):
+        self._select_proposal(self.CSID)
+        with self._conflict():
+            rc, err, out = self._install("--accept-proposed", "--client", "codex")
+            nonce = self._assert_codex_conflict_previews(rc, err, out)
+            self.result.reset_mock()
+            rc, err, out = self._install("--confirm", nonce, "--client", "codex")
+        self.assertEqual(rc, 3)
+        self.perform.assert_not_called()
+        self.run_step.assert_not_called()
+        self.subproc.assert_not_called()
+        self.result.assert_called_once_with("stale_nonce", self.CSID, self.NAME)
+
+    def test_conflicting_markers_codex_confirm_with_user_reply_installs(self):
+        self._select_proposal(self.CSID)
+        with self._conflict():
+            rc, err, out = self._install("--accept-proposed", "--client", "codex")
+            nonce = self._assert_codex_conflict_previews(rc, err, out)
+            self.assertTrue(sfx._confirm_plugin_install_pending(self.CSID, self.NAME, nonce))
+            self.perform.return_value = 0
+            rc, err, out = self._install("--confirm", nonce, "--client", "codex")
+        self.assertEqual(rc, 0)
+        self.perform.assert_called_once_with(self.NAME, self.entry, self.CSID, "codex")
+
+    def test_codex_only_markers_accept_proposed_trusted_source_installs_immediately(self):
+        self._select_proposal(self.CSID)
+        self.perform.return_value = 0
+        with mock.patch.dict(sfx.os.environ, {
+                "CODEX_THREAD_ID": "thread-1", "SF_AGENT_CLIENT": "codex"}):
+            rc, err, out = self._install("--accept-proposed")
+        self.assertEqual(rc, 0)
+        self.perform.assert_called_once_with(self.NAME, self.entry, self.CSID, "codex")
+        self.assertIsNone(sfx._load_plugin_install_pending(self.CSID))
+
+    def test_decline_still_works_under_an_unknown_host(self):
+        with self._conflict(), \
+                mock.patch.object(sfx, "_record_plugin_decline", return_value=(True, None)):
+            rc, err, out = self._install("--decline")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertIn("declined for this session", out)
+        self.run_step.assert_not_called()
+        self.subproc.assert_not_called()
+        self.result.assert_called_once_with("declined", "sess-unknown", self.NAME)
+
+    def test_clear_claude_host_is_not_refused(self):
+        with mock.patch.dict(sfx.os.environ, {"CLAUDECODE": "1"}):
+            rc, err, _ = self._install()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("host is unclear", err)
+        self.result.assert_called_once_with("previewed", "sess-unknown", self.NAME)
 
 
 class PromptTextCaptureTests(unittest.TestCase):

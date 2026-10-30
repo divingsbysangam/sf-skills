@@ -23,6 +23,32 @@ The output is a JSON object with a `tools` array (plus a `diagnostic` block on a
 
 Note: the Code Analyzer plugin is a JIT ("just-in-time") plugin — if it is registered but not yet physically installed, `check-tools` reports it 🟢 with a note that it auto-installs on first `sf code-analyzer` run. That is expected and not a problem.
 
+## Optional Headless 360 recommendation
+
+Read the separate `Salesforce MCP (headless-360)` row. Recommend enabling H360 for
+better answers about live Setup settings and org-specific caps. Distinguish local
+opt-in from org activation and endpoint health: disabled/unknown opt-in is not proof
+that the org server is inactive. If an enabled probe reports inactive: in the org's
+Setup Quick Find, search **MCP Servers**, select **MCP Servers** under **API Catalog**,
+and toggle **Headless360** on. Allow up to two minutes, then rerun status.
+Never activate it automatically. See the [activation guide](https://developer.salesforce.com/docs/platform/hosted-mcp-servers/guide/activate-mcp-servers.html).
+
+For Claude Code, direct the user to the plugin option. For Codex CLI/desktop, use
+the H360 integration skill's saved local preference and start a new session; no shell
+export is required. Endpoint reachability does not prove the host exposes the tools.
+H360 remains optional; its warnings do not block scaffolding or other work.
+
+## Optional Metadata Grounding
+
+Read the separate `Salesforce MCP (metadata-grounding)` row. Grounding finds metadata by
+meaning, and it needs Salesforce Catalog in the org. Turning on Catalog needs a Data Cloud
+license; an admin turns it on through Feature Manager in Data Cloud Setup. If the row warns
+that it is not connected, explain the steps: once Catalog is on, search **MCP Servers** in
+the org's Setup Quick Find and activate **metadata-grounding**, then rerun status. The same
+warning also covers a network or VPN problem. Never activate it automatically, and offer no
+install command, because nothing local fixes it. Grounding stays optional: its warnings do
+not block scaffolding, and the grounding skills fall back to name matching without it.
+
 ## Phase 2: Install / Update
 
 **If all green:** confirm setup is complete — the user is ready to develop.

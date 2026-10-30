@@ -404,6 +404,8 @@ class NaturalLanguagePaintUiModes(unittest.TestCase):
             mock.patch.object(SFX, "project_stats", return_value={}),
             mock.patch.object(SFX, "git_status_line", return_value=""),
             mock.patch.object(SFX, "_live_mcp_summary", return_value=""),
+            mock.patch.object(SFX, "_grounding_status_row", return_value={
+                "status": "info", "message": "Optional; not yet checked"}),
             mock.patch.object(SFX, "render_status_surface", return_value=FULL_STATUS),
             mock.patch.object(SFX, "_render_getting_started_welcome",
                               return_value=FULL_WELCOME),

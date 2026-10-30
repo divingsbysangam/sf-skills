@@ -94,7 +94,10 @@ Two properties are load-bearing and easy to erode by accident during future edit
   develop's pre-existing behavior), because the drop happens *after* the full corpus was scored, so it
   never changes a band. Fail-open `enabled is None` (settings unreadable) treats every candidate as
   uninstalled, so the recommender stays useful rather than going silent when it cannot confirm install
-  state. (This reverses the short-lived "you already have this — run its command" routing; see the
+  state. Install state is **per agent** and read only from that agent's own config (see
+  "Host-specific install and activation" below): a plugin enabled only in Claude's settings file is
+  not installed for Codex, and an unclear host reads no config at all and is treated as
+  uninstalled. (This reverses the short-lived "you already have this — run its command" routing; see the
   decision-log entry "Recommendations are uninstalled-only", 2026-08-31.)
 - **Request scaffolding is not product evidence.** The scorer removes common function words,
   generic action verbs, and the shared `Salesforce` umbrella term from both prompts and registry
@@ -177,10 +180,34 @@ Two properties are load-bearing and easy to erode by accident during future edit
   `examplePrompts`/`keywords` so an anchor set never silently makes an example unmatchable.
 - **Sensitivity is one configurable value, not a separate on/off switch.** `off` is simply the most
   conservative point on the same scale as the high/medium band threshold, resolved with precedence
-  (highest wins): the `SF_DISABLE_PLUGIN_MATCH` / `SF_PLUGIN_MATCH_SENSITIVITY` env vars, a per-user
-  in-session preference (`/salesforce-development:plugin-recommendations on|off|status|set
+  (highest wins): `SF_DISABLE_PLUGIN_MATCH`, `SF_PLUGIN_MATCH_SENSITIVITY`, the user's saved
+  preference for **this project**, the user's saved preference for **all projects**
+  (`/salesforce-development:plugin-recommendations [--project] on|off|status|set
   <level-or-number>`, persisted to `~/.sf/plugin-recommendations/config.json`), the plugin's own
-  `userConfig.plugin_match_sensitivity` install-level default, then `standard`. Named levels
+  `userConfig.plugin_match_sensitivity` install-level default (Claude only; see the state-ownership
+  rule below), then `standard`. The file holds `{"sensitivity": <all-projects>, "projects":
+  {"<project root>": {"sensitivity": ...}}}`; the project key is the nearest `sfdx-project.json`
+  ancestor, else the working directory, and a legacy `{"sensitivity": ...}` file is the
+  all-projects value unchanged. `on` without `--project` clears only the all-projects value and
+  keeps project values (the output notes when this project still has its own). `status` prints the
+  winning tier as `Source` (your saved preference for this project / for all projects, env var,
+  `plugin default (userConfig)`, or `built-in default`) and the `Project` key. The file is capped at
+  64 KiB, and an empty document deletes it. Updates hold a persistent OS lock across the
+  read/modify/write operation and refuse to replace or delete an unreadable document. A save
+  exceeding the cap reports capacity explicitly and leaves the file unchanged. The explicit
+  `plugin-recommendations prune` action removes entries only for project paths that no longer
+  exist; existing and inaccessible paths and the global preference are preserved. It never runs
+  automatically. `on --project` can also remove an unneeded override from an existing project.
+  Preference resolution reads one fresh document for both saved tiers on each call.
+  **State ownership (W-24599110).** *Install state is per agent*: enabled plugins and install-time
+  `userConfig` defaults such as `CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY` belong to one agent
+  and are read from that agent's own config. *Preferences are the user's*: shared by every agent and
+  stored under `~/.sf/` only, never in `.claude/` or `.codex/`, so one change applies to Claude Code
+  and Codex alike. The Claude `userConfig` default is therefore not read when the state host is
+  Codex. This is a limit of Codex, not a gap to close here: Codex has no install-time plugin
+  options, so the slot stays empty under Codex by design. Codex users have two
+  routes: `SF_PLUGIN_MATCH_SENSITIVITY` in the launch environment of the Codex CLI process, or a
+  saved `plugin-recommendations [--project] set` preference. Named levels
   (`low`/`standard`/`high`) keep a stable customer-facing contract even if the BM25 scoring is
   retuned later; a custom number in `1.0`-`10.0` gives finer control. The custom number IS the raw
   threshold compared against the match score, so its direction is the *inverse* of the "high"/"low"
@@ -303,6 +330,43 @@ but its runtime facts and handoff differ: installed state comes from enabled row
 Codex session plus resubmission rather than `/reload-plugins`. Codex session markers use a separate
 namespace, so a proposal or pending confirmation from one host can never authorize the other. An
 unavailable Codex inventory remains fail-open, matching the existing Claude settings-read behavior.
+
+Install state is per agent, so the host is decided before any config is read (W-24599110). Hooks
+and command adapters set `SF_AGENT_CLIENT`, but a shell command the model runs inside Codex may
+not, so `_inferred_plugin_host()` also reads each agent's own markers. Codex: `CODEX_THREAD_ID` /
+`CODEX_SESSION_ID`, or the plugin root under `$CODEX_HOME/plugins/cache`. Claude:
+`CLAUDE_CODE_SESSION_ID` / `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, or the plugin root under the
+Claude config dir's `plugins/`. Both sets present is `unknown`. With neither, `CODEX_HOME` set
+means Codex (a weak marker, used only when no Claude marker exists); otherwise the legacy Claude
+default holds. Two resolvers apply it:
+
+- `_plugin_client()` (presentation and host commands): explicit argument, then `SF_AGENT_CLIENT`,
+  then inference. `unknown` presents as Claude-style wording only.
+- `_plugin_state_host()` (install state): contradictory explicit selectors are `unknown`, so
+  neither agent's inventory is read. Otherwise a Codex claim wins; a Claude claim contradicted by
+  Codex markers becomes `unknown`. `unknown` never reads Claude's settings and is treated as
+  uninstalled, so the recommender keeps recommending (fail open) instead of hiding a plugin the
+  current agent does not have.
+
+Under `unknown`, `plugin-install` is a refusal, not an install: it creates no preview or nonce,
+starts no `claude`/`codex` subprocess, prints the manual commands for both hosts (`claude plugin
+marketplace add forcedotcom/sf-skills` then `claude plugin install <name>@salesforce`; `codex plugin
+marketplace add forcedotcom/sf-skills` then `codex plugin add <name>@salesforce`) to stdout so the
+route note's "relay the command's stdout" handoff relays them, exits 2, and records
+`plugin_install_result` reason `host_unclear`. The text tells the model to show the commands to the
+user, who runs the one for their agent, and not to retry or override the host with `SF_AGENT_CLIENT`
+or `--client`: a model-chosen override would pick the install target itself. An explicit
+`--client claude` or `SF_AGENT_CLIENT=claude` contradicted by a Codex marker is refused the same way,
+as are `--client` and `SF_AGENT_CLIENT` naming different agents. The presentation helper may use
+the requested client for wording, but the state helper and installer share the same conflict
+check, so a disagreement cannot choose an inventory or execute a host command. This covers the initial and `--confirm`
+paths. Agreeing values work as before.
+An explicit codex selector (`--client codex` or `SF_AGENT_CLIENT=codex`, which Codex hooks always
+set) is still honored under conflicting markers so a Codex session with leaked Claude markers keeps
+working, but it is unverified and never gets the trusted-source `--accept-proposed` fast path: it
+goes through the source preview and nonce, and the Codex confirm requires the user's own recorded
+confirmation reply. `--decline` still works. With no markers at all the host is
+`claude` (the legacy default, kept deliberately).
 
 The workflow treats the user's explicit acceptance of a recommendation as the authorization to
 install a plugin from a trusted source. UserPromptSubmit pins that exact
@@ -444,8 +508,11 @@ All companions are checked against raw lowercase prompt tokens, including
 all-surface flag: the flag controls only where the anchor gate applies. Existing
 companion sets without stop words or one-letter tokens keep the same behavior.
 Anchors still need to be among the scored matched terms. Each anchor qualifies
-with any one declared companion, anywhere in the prompt; punctuation separates
-words, and no adjacency, phrase matching or multi-word AND groups are implied.
+with any one declared alternative, anywhere in the prompt. A string alternative
+requires that token or adjacent-token phrase; a nested array requires every member.
+Only explicit phrase strings require adjacency/order with whitespace or hyphens
+between tokens; sentence punctuation breaks a phrase. Legacy tokens still match
+anywhere in the prompt.
 
 This consolidates capability qualification into one anchor vocabulary. It replaces
 the proposed `requiredEvidence` phrase groups after Omni and Education comparisons
@@ -472,3 +539,100 @@ territories and institutional knowledge-article hierarchies. A `student` anchor
 with `enrollment` covers the curated recruitment request. Bare academic-calendar
 requests without workflow qualifiers deliberately remain quiet. Shared thresholds
 and the existing all-surface anchor contract remain unchanged.
+
+
+### IT Service review: phrases and grouped companions (2026-10-19)
+
+The review probe reproduced 14 unrelated requests at high confidence, with all 84
+scorer/surface checks failing (14 prompts × two scorer modes plus four consumers).
+The core request `Set up Agentforce for IT Service` must remain supported.
+
+| Probe | Original | Existing-field tightening | Phrases + groups |
+| --- | --- | --- | --- |
+| Set up Agentforce for IT Service | high | lost with ITSM-only anchors | high |
+| Enable IT Service Agentforce Studio | high | lost with ITSM-only anchors | high |
+| Configure Employee agent for IT Service | high | lost with ITSM-only anchors | high |
+| Configure Fulfiller agent for IT Service | high | high via distinctive fulfiller | high |
+| Assign ITSM Agentforce permissions | high | high | high |
+| Assign IT Service Agentforce runtime access | high | lost with ITSM-only anchors | high |
+| Test my Agentforce agent and fix it | high | suppressed if `it` removed | suppressed |
+| Set up the service console and configure it | high | suppressed if `service` removed | suppressed |
+| Set up Agentforce for Employee Service | high | still high if agentforce + service allowed | suppressed |
+| Enable Swarming for ITSM | high | still high with bare ITSM anchor | suppressed |
+| Configure CMDB for IT Service | high | suppressed if `service` removed | suppressed |
+| Set up Agentforce runtime access for TPE users | high | suppressed if generic runtime removed | suppressed |
+
+Curated scoring text alone cannot separate the core request from Employee Service:
+`it` is a scoring stop word, so the latter has a superset of scored core tokens,
+and BM25 contributions are nonnegative. Removing Employee text cannot lower the
+negative below the core. Existing anchor/companion pairs also cannot distinguish
+all cases: agentforce + service admits Employee Service, agentforce + it admits
+pronoun requests, and service + it admits console requests. The all-surface flag
+only applies the same gate to additional consumers. The ITSM-only alternative
+measurably loses four of six core requests above.
+
+Extend the existing `anchorCompanions` value grammar with explicit token phrases
+and nested AND groups, rather than adding a second evidence field or a parallel matcher. Alternatives
+remain OR; members within a group are AND. For example,
+`"agentforce": ["itsm", "it service"]` requires either explicit ITSM or
+the adjacent product words. Product phrases qualify capability anchors
+(agentforce, studio, employee, runtime);
+employee/runtime also require `agent` or `agents`. Bare service is removed and ITSM requires
+Agentforce, Studio, Fulfiller, employee + agent(s), or runtime + agent(s) capability
+evidence, so unrelated ITSM workflows remain excluded. Fulfiller stays
+a distinctive standalone anchor. This also permits future ambiguous product names
+such as multi-token cloud products without introducing phrase regexes or vendor
+exclusions. Phrases/groups use raw tokens like legacy companions, not scoring text;
+scores, thresholds, action intent, and installation rules are unchanged.
+
+Both authoring and runtime artifact validation reject empty alternatives, groups
+with fewer than two members, nested groups, noncanonical token/phrase strings,
+duplicates, and anchors absent from anchorTerms. Existing string lists retain their exact meaning.
+The four-consumer regression suite covers the full review corpus, supported natural
+requests, installed suppression, and neighboring Agentforce/Service ownership.
+
+
+Compatibility and rollback: new readers accept all legacy string lists unchanged;
+new writers emit phrase/group alternatives only for IT Service. Older readers reject
+phrases/nested values during catalog validation rather than broadening eligibility. Build
+and publish the runtime and generated catalog together as one plugin tree; copying
+a new catalog into an old installed runtime is unsupported and fails closed. To
+roll back independently, first remove phrase/group marketplace usage and regenerate
+(the safe temporary alternative is ITSM-qualified requests only), then revert reader
+support. Reverting the complete packaged tree restores the previous behavior.
+
+
+Independent review expanded the comparison: token-AND `["it", "service"]`
+still recommended at high confidence for `Set up a service agent in Agentforce
+and test it` (10.99) and `Fix our Agentforce service agent in Service Cloud;
+it is broken` (7.68). Employee/runtime + product context alone also admitted
+`Configure employee records for IT Service` (7.83) and `Configure runtime
+monitoring for IT Service` (8.76). The phrase `it service` excludes the pronoun
+cases; grouping that phrase with `agent` excludes record/monitoring requests.
+All four are negative regressions across all consumers. Case and punctuation
+normalization keep `AGENTFORCE for IT SERVICE` and `employee agent for IT-Service`
+supported. Phrase members use the existing raw tokenizer; this remains one
+anchor-companion gate, without phrase-specific scoring or a separate rule layer.
+
+
+Replace the padded duplicate setup example with the distinct supported Studio
+prerequisite-validation request in Lightning Experience. This preserves truthful
+coverage of the bundled validator and the existing shared Lightning corpus evidence:
+removing it entirely raises Lightning Widgets from medium (3.13) to high (3.64)
+on the existing mobileCapabilities regression; the validation example keeps it
+medium (3.13), with Mobile Development high (12.24). No threshold or neighboring
+plugin policy is changed to compensate for catalog copy.
+
+
+Singular/plural agent wording is explicit: Employee and runtime groups accept
+`agent` or `agents`, including both IT Service phrases and ITSM. There is no
+stemming; generic employee records, portal access, and runtime monitoring stay
+excluded. Both plural request forms are exercised through all four consumers.
+
+
+Phrase boundaries preserve whitespace/hyphen product spelling without joining
+separate clauses: `test it. Service Cloud ...`, `test it; service agents ...`,
+and equivalent `!`/`?` boundaries do not supply `it service`. Legacy single-token
+companions and AND members still use the full raw-token set; only the new phrase
+alternative requires a continuous product-token run. Boundary probes cover scorer
+and all four consumers alongside the legitimate hyphen/case variants.

@@ -89,7 +89,7 @@
     {
       "name": "salesforce-development",
       "source": "./plugins/builder/salesforce-development",
-      "description": "Foundation layer for Salesforce platform development — 37 skills for environment validation, project scaffolding, scratch-org lifecycle, declarative metadata, Apex (author, run anonymous, test, debug), flow automation, SOQL, deploy/retrieve, manifest generation, security, reporting, and generated installed-versus-available capability discovery, plus org-context detection, a production deploy-safety gate, and a bundled Apex + SOQL language server (MCP).",
+      "description": "Foundation layer for Salesforce platform development — 38 skills for environment validation, project scaffolding, scratch-org lifecycle, declarative metadata, Apex (author, run anonymous, test, debug), flow automation, SOQL, deploy/retrieve, manifest generation, security, reporting, and generated installed-versus-available capability discovery, plus org-context detection, a production deploy-safety gate, and a bundled Apex + SOQL language server (MCP).",
       "keywords": [
         "salesforce",
         "apex",
@@ -773,6 +773,272 @@
             ],
             "sharing": [
               "work"
+            ]
+          },
+          "enforceAnchorsOnAllSurfaces": true
+        }
+      }
+    },
+    {
+      "name": "consumer-goods",
+      "source": "./plugins/builder/consumer-goods",
+      "description": "Set up Consumer Goods Cloud Trade Promotion Management (TPM) liability accruals and its summary Lightning component, plus Trade Promotion Effectiveness (TPE): deploy accrual and TPE data kits, configure Real Time Reporting (RTR) promotion-measure export to Data Cloud, prepare TPE dashboards and optional custom KPI measures, and manage supported Consumer Goods sync configurations and user assignments.",
+      "keywords": [
+        "Consumer Goods Cloud TPM",
+        "TPM liability accruals",
+        "TPM accrual data kit",
+        "TPM accrual Lightning component setup",
+        "Trade Promotion Effectiveness TPE",
+        "TPE data kit deployment",
+        "TPE dashboard setup",
+        "TPE custom KPI measures",
+        "RTR promotion measure export",
+        "TPM Data Cloud export",
+        "CG Cloud sync management",
+        "Consumer Goods sync configuration"
+      ],
+      "metadata": {
+        "match": {
+          "examplePrompts": [
+            "Deploy the Consumer Goods TPM liability accrual data kit and schedule its accrual chain",
+            "Set up the TPE data kit and Trade Promotion Effectiveness dashboards",
+            "Configure custom KPI measures for our TPE dashboards",
+            "Set up the RTR export of TPM promotion measures to Data Cloud for TPE",
+            "Configure Consumer Goods sync management and assign users to a sync configuration",
+            "Set up trade promotion management liability accruals",
+            "Set up real time reporting export from Consumer Goods Cloud to Data Cloud",
+            "Create custom KPIs for TPE dashboards",
+            "Set up TPE",
+            "Set up CG Cloud"
+          ],
+          "anchorTerms": [
+            "consumer",
+            "cg",
+            "tpm",
+            "tpe",
+            "rtr",
+            "cgcloud",
+            "trade",
+            "promotion",
+            "promotions",
+            "accrual",
+            "accruals",
+            "kpis"
+          ],
+          "anchorCompanions": {
+            "consumer": [
+              "tpe",
+              "rtr",
+              "liability",
+              "accruals",
+              "sync",
+              "measure",
+              "datakit",
+              "kit",
+              "kpi",
+              "component",
+              "reporting",
+              "effectiveness",
+              "kpis"
+            ],
+            "cg": [
+              "sync",
+              "tpe",
+              "effectiveness",
+              "datakit",
+              "kit",
+              "kpis",
+              "cg cloud"
+            ],
+            "tpm": [
+              "accruals",
+              "liability",
+              "datakit",
+              "data",
+              "kit",
+              "tpe",
+              "dashboard",
+              "sync",
+              "component",
+              "export"
+            ],
+            "rtr": [
+              "promotion",
+              "measure",
+              "export",
+              "tpe",
+              "tpm"
+            ],
+            "cgcloud": [
+              "sync",
+              "tpe",
+              "accruals",
+              "liability",
+              "datakit",
+              "export",
+              "dashboard",
+              "kpi",
+              "measure"
+            ],
+            "trade": [
+              "effectiveness",
+              "management",
+              "accrual",
+              "accruals"
+            ],
+            "promotion": [
+              [
+                "trade",
+                "effectiveness"
+              ],
+              [
+                "trade",
+                "management"
+              ],
+              [
+                "trade",
+                "accrual"
+              ],
+              [
+                "trade",
+                "accruals"
+              ]
+            ],
+            "promotions": [
+              [
+                "trade",
+                "effectiveness"
+              ],
+              [
+                "trade",
+                "management"
+              ],
+              [
+                "trade",
+                "accrual"
+              ],
+              [
+                "trade",
+                "accruals"
+              ]
+            ],
+            "accrual": [
+              "trade",
+              "promotions",
+              "tpm",
+              "cgcloud"
+            ],
+            "accruals": [
+              "trade",
+              "promotions",
+              "tpm",
+              "cgcloud"
+            ],
+            "kpis": [
+              "tpe",
+              "tpm",
+              "cgcloud"
+            ]
+          },
+          "enforceAnchorsOnAllSurfaces": true
+        }
+      }
+    },
+    {
+      "name": "service-itsm",
+      "source": "./plugins/builder/service-itsm",
+      "description": "Set up Agentforce for IT Service: enable Studio, configure Employee and Fulfiller agents, assign ITSM permissions, and grant runtime access.",
+      "keywords": [
+        "Agentforce for IT Service",
+        "ITSM Agentforce setup",
+        "Employee and Fulfiller agents",
+        "ITSM permissions",
+        "Agentforce runtime access"
+      ],
+      "metadata": {
+        "match": {
+          "examplePrompts": [
+            "Set up Agentforce for IT Service",
+            "Enable IT Service Agentforce Studio",
+            "Configure Employee agent for IT Service",
+            "Configure Fulfiller agent for IT Service",
+            "Assign ITSM Agentforce permissions",
+            "Assign IT Service Agentforce runtime access",
+            "Validate Agentforce Studio prerequisites for IT Service in Lightning Experience"
+          ],
+          "anchorTerms": [
+            "agentforce",
+            "itsm",
+            "fulfiller",
+            "studio",
+            "employee",
+            "runtime"
+          ],
+          "anchorCompanions": {
+            "agentforce": [
+              "itsm",
+              "it service"
+            ],
+            "studio": [
+              "itsm",
+              "it service"
+            ],
+            "employee": [
+              [
+                "itsm",
+                "agent"
+              ],
+              [
+                "itsm",
+                "agents"
+              ],
+              [
+                "it service",
+                "agent"
+              ],
+              [
+                "it service",
+                "agents"
+              ]
+            ],
+            "runtime": [
+              [
+                "itsm",
+                "agent"
+              ],
+              [
+                "itsm",
+                "agents"
+              ],
+              [
+                "it service",
+                "agent"
+              ],
+              [
+                "it service",
+                "agents"
+              ]
+            ],
+            "itsm": [
+              "agentforce",
+              "studio",
+              "fulfiller",
+              [
+                "employee",
+                "agent"
+              ],
+              [
+                "employee",
+                "agents"
+              ],
+              [
+                "runtime",
+                "agent"
+              ],
+              [
+                "runtime",
+                "agents"
+              ]
             ]
           },
           "enforceAnchorsOnAllSurfaces": true

@@ -1,6 +1,6 @@
 {
   "name": "salesforce-development",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "Build Salesforce apps and agents using metadata, Apex, deploy/retrieve, security, reporting, and capability discovery.",
   "author": {
     "name": "Salesforce",
@@ -14,19 +14,25 @@
   "commands": "./codex-commands/",
   "hooks": "./hooks/codex-hooks.json",
   "mcpServers": {
-    "salesforce-api-context": {
-      "type": "stdio",
-      "command": "python3",
-      "args": ["scripts/codex_mcp_launcher.py", "salesforce-api-context"],
-      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
-      "cwd": "."
-    },
     "salesforce-metadata-experts": {
       "type": "stdio",
       "command": "python3",
       "args": ["scripts/codex_mcp_launcher.py", "salesforce-metadata-experts"],
       "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
       "cwd": "."
+    },
+    "salesforce-metadata-grounding": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["scripts/codex_mcp_launcher.py", "salesforce-metadata-grounding"],
+      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD"],
+      "cwd": "."
+    },
+    "salesforce-headless-360": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-I", "-c", "import json\nimport os\nfrom pathlib import Path\nimport runpy\nimport sys\n\n# Native compatibility manifests do not expand plugin-root placeholders.\n# Setup registers the installed package explicitly; never scan or guess a cache.\ntry:\n    with (Path.home() / '.sf/salesforce-development/headless-360.json').open(encoding='utf-8') as stream:\n        raw = stream.read(8193)\n    config = json.loads(raw) if len(raw) <= 8192 else {}\n    if not isinstance(config, dict):\n        config = {}\nexcept (OSError, UnicodeError, ValueError, RecursionError):\n    config = {}\nvalue = os.environ.get('SF_HEADLESS_360_ENABLED')\nenabled = value.strip().lower() in ('1', 'true', 'enabled', 'on') if value is not None else config.get('enabled') is True\nroot = config.get('plugin_root')\nentry = None\nif enabled and isinstance(root, str) and Path(root).is_absolute():\n    try:\n        package = Path(root).resolve(strict=True)\n        manifest = json.loads((package / '.codex-plugin/plugin.json').read_text(encoding='utf-8'))\n        claude = json.loads((package / '.claude-plugin/plugin.json').read_text(encoding='utf-8'))\n        launcher = (package / 'scripts/codex_mcp_launcher.py').resolve(strict=True)\n        if (isinstance(manifest, dict) and manifest.get('name') == 'salesforce-development'\n                and isinstance(claude, dict) and claude.get('name') == manifest['name']\n                and isinstance(manifest.get('version'), str) and bool(manifest['version'])\n                and manifest['version'] == claude.get('version')\n                and package in launcher.parents and launcher.is_file()):\n            entry = launcher\n    except (OSError, UnicodeError, ValueError, RecursionError):\n        pass\nif entry is not None:\n    sys.argv = [str(entry), sys.argv[1]]\n    runpy.run_path(str(entry), run_name='__main__')\n    raise SystemExit(0)\nif enabled:\n    sys.stderr.write('Headless 360 setup required: ask Codex to enable Headless 360 again to register this installed plugin version.\\n')\n    raise SystemExit(2)\n\n\ndef reply(value):\n    try:\n        print(json.dumps(value), flush=True)\n    except BrokenPipeError:\n        # The host closed its pipe; avoid an extra traceback during shutdown.\n        os._exit(0)\n\nsys.stderr.write('Headless 360 disabled; no auth or network request made.\\n')\n# Default-off still completes an empty MCP handshake without auth or network work.\nfor line in sys.stdin:\n    if not line.strip():\n        continue\n    try:\n        request = json.loads(line)\n    except (ValueError, RecursionError):\n        reply({'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700, 'message': 'Parse error'}})\n        continue\n    if not isinstance(request, dict):\n        reply({'jsonrpc': '2.0', 'id': None, 'error': {'code': -32600, 'message': 'Invalid Request'}})\n        continue\n    if request.get('id') is None:\n        continue\n    method = request.get('method')\n    if method == 'initialize':\n        params = request.get('params')\n        params = params if isinstance(params, dict) else {}\n        result = {'protocolVersion': params.get('protocolVersion', '2025-06-18'),\n                  'capabilities': {'tools': {}}, 'serverInfo': {'name': 'salesforce-headless-360 (disabled)', 'version': '1.0.0'}}\n    elif method == 'tools/list':\n        result = {'tools': []}\n    elif method == 'ping':\n        result = {}\n    else:\n        reply({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'Headless 360 is disabled'}})\n        continue\n    reply({'jsonrpc': '2.0', 'id': request['id'], 'result': result})\n", "salesforce-headless-360"],
+      "env_vars": ["CODEX_WORKSPACE_ROOT", "SF_TARGET_ORG", "SFDX_TARGET_ORG", "INIT_CWD", "PWD", "SF_HEADLESS_360_ENABLED"]
     },
     "salesforce-lsp": {
       "type": "stdio",

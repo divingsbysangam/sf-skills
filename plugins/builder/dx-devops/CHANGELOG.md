@@ -7,6 +7,12 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-30
+
+### Changed
+
+- Updated skills: `dx-devops-conflict-resolve`, `dx-devops-pipeline-manage`, `dx-devops-project-manage`, `dx-devops-work-item-manage`.
+
 ## [0.2.0] — 2026-09-21
 
 ### Added

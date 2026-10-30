@@ -173,16 +173,9 @@ def build_catalog(repo_root: Path, plugin_root: Path) -> dict:
         ):
             raise PluginCatalogError(f"{marketplace_path}: {name!r} has invalid metadata.match.anchorTerms")
         anchor_companions = match_meta.get("anchorCompanions") if isinstance(match_meta, dict) else None
-        if anchor_companions is not None and not (
-            isinstance(anchor_companions, dict) and anchor_companions
-            and all(
-                type(key) is str and key in (anchor_terms or [])
-                and isinstance(value, list) and value
-                and all(type(item) is str and item for item in value)
-                for key, value in anchor_companions.items()
-            )
-        ):
-            raise PluginCatalogError(f"{marketplace_path}: {name!r} has invalid metadata.match.anchorCompanions")
+        if "anchorCompanions" in match_meta:
+            _validate_anchor_companions(anchor_companions, anchor_terms or [],
+                                        f"{marketplace_path}: {name!r}")
         if "requiredEvidence" in match_meta:
             raise PluginCatalogError(
                 f"{marketplace_path}: {name!r} uses replaced metadata.match.requiredEvidence; "
@@ -282,6 +275,71 @@ _MATCH_OPTIONAL_KEYS = {"anchorTerms", "anchorCompanions", "entryCommand", "enfo
 _MATCH_KEYS = _MATCH_REQUIRED_KEYS | _MATCH_OPTIONAL_KEYS
 
 
+def _validate_anchor_companions(value: object, anchors: list, context: str) -> None:
+    """One companion grammar for marketplace authors and loaded artifacts."""
+    valid = type(value) is dict and bool(value)
+    if valid:
+        for anchor, alternatives in value.items():
+            if type(anchor) is not str or anchor not in anchors or type(alternatives) is not list or not alternatives:
+                valid = False
+                break
+            seen = set()
+            for alternative in alternatives:
+                if type(alternative) is str:
+                    tokens = [alternative]
+                elif type(alternative) is list and len(alternative) >= 2:
+                    tokens = alternative
+                else:
+                    valid = False
+                    break
+                if (not all(type(token) is str and _COMPANION_PATTERN.fullmatch(token) for token in tokens)
+                        or len(tokens) != len(set(tokens))):
+                    valid = False
+                    break
+                key = tuple(sorted(tokens))
+                if key in seen:
+                    valid = False
+                    break
+                seen.add(key)
+            if not valid:
+                break
+    if not valid:
+        raise PluginCatalogError(f"{context}: invalid match anchorCompanions")
+
+
+def _companion_prompt_evidence(prompt: str) -> tuple:
+    """Keep legacy raw tokens; phrase runs stop at non-product separators."""
+    text = prompt.lower()
+    tokens, segments, run = [], [], []
+    previous_end = 0
+    for match in _TOKEN_PATTERN.finditer(text):
+        separator = text[previous_end:match.start()]
+        if run and not all(char.isspace() or char == "-" for char in separator):
+            segments.append(" " + " ".join(run) + " ")
+            run = []
+        tokens.append(match.group())
+        run.append(match.group())
+        previous_end = match.end()
+    if run:
+        segments.append(" " + " ".join(run) + " ")
+    return tokens, segments
+
+
+def _anchor_companions_match(alternatives: list, raw_tokens: list, phrase_segments=None) -> bool:
+    # Phrase runs preserve product separators without crossing sentence punctuation;
+    # legacy single tokens still match anywhere in the prompt.
+    terms = set(raw_tokens)
+    if phrase_segments is None:
+        phrase_segments = [" " + " ".join(raw_tokens) + " "]
+
+    def present(value):
+        return value in terms if " " not in value else any(" " + value + " " in run for run in phrase_segments)
+
+    return any(present(alternative) if type(alternative) is str
+               else all(present(value) for value in alternative)
+               for alternative in alternatives)
+
+
 def _validate_anchor_policy(value: object, anchors: object, context: str) -> None:
     if type(value) is not bool:
         raise PluginCatalogError(f"{context}: enforceAnchorsOnAllSurfaces must be a boolean")
@@ -336,17 +394,8 @@ def _validate_catalog(data, context: str) -> None:
                     or len(anchor_terms) != len(set(anchor_terms))):
                 raise PluginCatalogError(f"{row_context}: invalid match anchorTerms")
         if "anchorCompanions" in match:
-            companions = match["anchorCompanions"]
-            anchors = set(match.get("anchorTerms", ()))
-            if (type(companions) is not dict or not companions
-                    or not all(
-                        type(key) is str and key in anchors
-                        and type(value) is list and value
-                        and all(type(item) is str and _TOKEN_PATTERN.fullmatch(item) for item in value)
-                        and len(value) == len(set(value))
-                        for key, value in companions.items()
-                    )):
-                raise PluginCatalogError(f"{row_context}: invalid match anchorCompanions")
+            _validate_anchor_companions(match["anchorCompanions"], match.get("anchorTerms", []),
+                                        row_context)
         if "enforceAnchorsOnAllSurfaces" in match:
             _validate_anchor_policy(match["enforceAnchorsOnAllSurfaces"],
                                     match.get("anchorTerms"), row_context)
@@ -387,6 +436,7 @@ DEDUP_SCORE_MARGIN = 1.0
 DEDUP_OVERLAP_THRESHOLD = 0.6
 # Curated anchor schema remains ASCII; prompt tokenization is separate.
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+_COMPANION_PATTERN = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)*")
 
 
 def _unicode_words(text: str) -> list[str]:
@@ -573,13 +623,14 @@ def score_prompt_against_catalog(
     reactive bypass gate) should pass False to restore plain high+medium
     recall for plugins whose anchor set doesn't cover every legitimate phrase.
     Entries declaring `enforceAnchorsOnAllSurfaces=True` retain the anchor gate
-    even on solicited surfaces. All companion checks use raw prompt tokens, including
+    even on solicited surfaces. String companion alternatives require their token or adjacent-token phrase;
+    grouped alternatives require all their members. All companion checks use raw prompt tokens, including
     scoring stop words such as Salesforce, independently of this flag.
     """
     threshold = HIGH_CONFIDENCE_THRESHOLD if high_confidence_threshold is None else high_confidence_threshold
     plugins = catalog_data["plugins"]
     query_terms = set(_tokenize(prompt))
-    raw_terms = set(_TOKEN_PATTERN.findall(prompt.lower()))
+    raw_tokens, phrase_segments = _companion_prompt_evidence(prompt)
     if not query_terms or not plugins:
         return []
     doc_tokens_by_name = {plugin["name"]: _plugin_document_tokens(plugin) for plugin in plugins}
@@ -618,7 +669,7 @@ def score_prompt_against_catalog(
             # BM25 scoring; the flag controls only which surfaces apply the gate.
             anchor_hits = {
                 term for term in matched_terms.intersection(anchor_terms)
-                if not companions.get(term) or not raw_terms.isdisjoint(companions[term])
+                if not companions.get(term) or _anchor_companions_match(companions[term], raw_tokens, phrase_segments)
             }
             if not anchor_hits:
                 continue

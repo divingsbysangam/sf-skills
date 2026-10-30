@@ -1,7 +1,7 @@
 {
   "name": "salesforce-development",
   "displayName": "Salesforce Development",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "Build Salesforce apps and agents using these core building blocks: metadata, Apex, deploy/retrieve, security, reporting, and generated installed-versus-available capability discovery.",
   "author": { "name": "Salesforce", "url": "https://github.com/forcedotcom/sf-skills" },
   "license": "Apache-2.0",
@@ -23,6 +23,13 @@
       "description": "How readily this plugin proposes an uninstalled Salesforce plugin matching your task: off (never), low, standard (default), or high. For a custom numeric threshold (1.0-10.0), set it from within a session with /salesforce-development:plugin-recommendations.",
       "options": ["off", "low", "standard", "high"],
       "default": "standard"
+    },
+    "headless_360_enabled": {
+      "type": "string",
+      "title": "Headless 360 MCP server",
+      "description": "Enable the optional org-specific Headless 360 MCP server. Disabled by default; enabling requires the server to be activated in the target org.",
+      "options": ["disabled", "enabled"],
+      "default": "disabled"
     }
   },
   "skills": "./skills/",

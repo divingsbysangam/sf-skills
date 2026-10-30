@@ -77,6 +77,7 @@ TRIAL_HOST_MARKERS = (
     'orgfarm-',                      # OrgFarm-provisioned trials/dev orgs
     '.pc-rnd.',                      # internal pc-rnd dev hosts
     '.develop.my.salesforce.com',    # Developer Edition / trial My Domain hosts
+    '.demo.my.salesforce.com',       # demo org My Domain hosts (partitioned domains)
     '.scratch.my.salesforce.com',    # scratch My Domain hosts (belt-and-suspenders)
 )
 is_trial_host = has_trial_exp or any(m in instance for m in TRIAL_HOST_MARKERS)
@@ -622,12 +623,12 @@ case "$COMMAND" in
 
     if [ "$BUCKET" = "production" ] && [ "$HAS_CONFIRMATION" != "true" ]; then
       if [ "$CLIENT" = "codex" ]; then
-        deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Do not change the command to get past this check. Ask the user to reply with exactly: confirm production deploy to ${TARGET_ORG} — then rerun the same command unchanged. Recommended workflow: validate first with the 'platform-deploy-validate' skill (returns a 10-day job ID), then deploy with the 'platform-quick-deploy' skill."
+        deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Do not change the command to get past this check. Ask the user to reply with exactly: confirm production deploy to ${TARGET_ORG} — then rerun the same command unchanged. Recommended workflow: follow the 'platform-metadata-deploy' skill's production path — validate first (returns a 10-day job ID), then quick-deploy that job."
       fi
-      deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Recommended workflow:
-1. Use 'platform-deploy-validate' skill to validate (returns a 10-day job ID)
-2. Use 'platform-quick-deploy' skill which gates with explicit user confirmation
-Or, to override this hook, prepend 'CONFIRM_PROD=1' to your command (NOT recommended)."
+      deny "BLOCKED: target org '${TARGET_ORG}' appears to be a Production org. Production deploys must be explicitly confirmed by the developer. Recommended workflow — use the 'platform-metadata-deploy' skill's production path:
+1. 'sf project deploy validate' to validate (returns a 10-day job ID)
+2. confirm the target and job with the user, then promote with 'CONFIRM_PROD=1 sf project deploy quick --job-id <id>'
+The 'CONFIRM_PROD=1' marker relays that already-obtained confirmation to this hook — add it only AFTER the user has confirmed, never to pre-empt the check."
     fi
 
     if [ "$BUCKET" = "production" ]; then
