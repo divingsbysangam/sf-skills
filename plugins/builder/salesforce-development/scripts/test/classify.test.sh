@@ -39,6 +39,21 @@ assert_bucket trial "OrgFarm trial (null flags, orgfarm host)" \
 assert_bucket trial "Developer Edition (.develop.my host)" \
   '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://mydomain.develop.my.salesforce.com"}}'
 
+assert_bucket trial "Demo org (.demo.my host, no expiration)" \
+  '{"result":{"isSandbox":false,"isScratch":false,"orgEdition":"Enterprise Edition","instanceUrl":"https://acme.demo.my.salesforce.com"}}'
+
+assert_bucket trial "Demo org host is matched case-insensitively" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://ACME.DEMO.MY.SALESFORCE.COM"}}'
+
+assert_bucket sandbox "Sandbox on demo partition wins over trial" \
+  '{"result":{"isSandbox":true,"isScratch":false,"instanceUrl":"https://acme--sb.demo.my.salesforce.com"}}'
+
+assert_bucket production "Look-alike My Domain name (acme-demo.my host)" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme-demo.my.salesforce.com"}}'
+
+assert_bucket production "My Domain named demo (demo.my host)" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://demo.my.salesforce.com"}}'
+
 assert_bucket trial "pc-rnd internal dev host" \
   '{"result":{"isSandbox":null,"isScratch":null,"instanceUrl":"https://na1.pc-rnd.salesforce.com"}}'
 

@@ -67,11 +67,12 @@ never reaches telemetry.
 | Class | Reasons |
 | --- | --- |
 | Completed | `installed`, `previewed`, `declined` |
-| No install attempt | `usage_error`, `invalid_name`, `catalog_unreadable`, `unknown_plugin`, `self_plugin`, `already_installed`, `decline_refused`, `proposal_not_selected` |
+| No install attempt | `usage_error`, `invalid_name`, `catalog_unreadable`, `unknown_plugin`, `self_plugin`, `already_installed`, `decline_refused`, `proposal_not_selected`, `host_unclear` |
 | Retryable confirmation | `stale_nonce` |
 | Genuine install failure | `subprocess_failure` |
 
-Only `subprocess_failure` is the actual `claude plugin install` failure signal. The existing
+`host_unclear` is a refusal (the agent host could not be determined, so nothing was run), not an
+install failure. Only `subprocess_failure` is the actual `claude plugin install` failure signal. The existing
 `command.invoked` `outcome = 'failure'` remains a nonzero-exit signal for backwards compatibility.
 
 ## Correct nested-message projection

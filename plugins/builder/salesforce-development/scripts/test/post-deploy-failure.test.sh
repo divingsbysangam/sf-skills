@@ -62,10 +62,10 @@ echo "sf-context post-deploy-failure — decision (offline, no org)"
 check advise platform-metadata-deploy "deploy start failure → platform-metadata-deploy" \
   '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"sf project deploy start --source-dir force-app --json"},"error":"Exit code 1"}'
 
-check advise platform-deploy-validate "deploy validate failure → platform-deploy-validate" \
+check advise platform-metadata-deploy "deploy validate failure → platform-metadata-deploy" \
   '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"sf project deploy validate --source-dir force-app --json"},"error":"Exit code 1"}'
 
-check advise platform-quick-deploy "deploy quick failure → platform-quick-deploy" \
+check advise platform-metadata-deploy "deploy quick failure → platform-metadata-deploy" \
   '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"sf project deploy quick --job-id 0Af000 --json"},"error":"Exit code 1"}'
 
 # --- non-deploy failures → quiet (fail-open) ---

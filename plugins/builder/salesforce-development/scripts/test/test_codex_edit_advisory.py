@@ -142,7 +142,7 @@ class CodexEditContracts(unittest.TestCase):
         result=hooks.dispatch('SessionStart',self.payload(''))
         text=result['hookSpecificOutput']['additionalContext']
         for term in ['--json','direct Salesforce APIs','owning skill and target org',
-                     'platform-deploy-validate','platform-destructive-deploy','code analysis',
+                     'platform-metadata-deploy','platform-destructive-deploy','code analysis',
                      'governor-limit','Automatic deployment','dispatch ledger']:
             self.assertIn(term,text)
         self.assertNotIn('Telemetry Usage',result.get('systemMessage',''))

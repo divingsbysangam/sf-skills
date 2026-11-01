@@ -1,6 +1,6 @@
 {
   "name": "salesforce-code-quality",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Analyze and govern Salesforce code quality with Salesforce Code Analyzer and the Well-Architected framework: set up and troubleshoot Code Analyzer, run security/performance/best-practice/style scans across engines (PMD, ESLint, CPD, RetireJS, Flow, SFGE, ApexGuru), author custom Regex/PMD/ESLint rules, and run a multi-pillar Well-Architected architecture review with file:line evidence. Use for static analysis, code scanning, quality gates, custom lint rules, or a holistic architecture/Well-Architected audit — includes a read-only architecture-review agent.",
   "author": {
     "name": "Salesforce"

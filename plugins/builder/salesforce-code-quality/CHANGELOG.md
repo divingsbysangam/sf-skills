@@ -7,6 +7,12 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-30
+
+### Changed
+
+- Updated skills: `dx-code-analyzer-custom-rule-create`, `dx-code-analyzer-run`.
+
 ## [0.1.0] — 2026-09-02
 
 ### Added

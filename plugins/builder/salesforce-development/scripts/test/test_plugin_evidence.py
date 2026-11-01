@@ -19,7 +19,7 @@ from _test_support import load_module
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 ROOT = SCRIPTS.parents[3]
-TARGETS = {'education-cloud', 'service-omni'}
+TARGETS = {'education-cloud', 'service-omni', 'service-itsm', 'consumer-goods'}
 NEGATIVES = [
     'Write a course syllabus', 'Manage a campus network',
     'Set up an employee training course catalog',
@@ -48,7 +48,54 @@ NEGATIVES = [
     'Route voice calls', 'Please route voice calls',
     'Can you route voice calls?', 'Configure voice call routing',
 ]
+# Review regressions belong to this plugin; neighboring plugins may own the request.
+ITSM_NEGATIVES = [
+    'Test my Agentforce agent and fix it',
+    'Deploy the Agentforce agent, then publish it',
+    'Set up the service console and configure it',
+    'Set up Microsoft Teams for IT Service',
+    'Configure CMDB for IT Service',
+    'Configure incident management for IT Service',
+    'Set up IT Service incident SLA',
+    'Enable Swarming for ITSM',
+    'Enable Agentforce Studio',
+    'Configure Agentforce Studio agent builder for sales',
+    'Configure Agentforce Employee Agent for HR questions',
+    'Configure Agentforce runtime for Service Cloud voice',
+    'Set up Agentforce for Employee Service',
+    'Set up Agentforce runtime access for TPE users',
+    'Configure incident permissions for ITSM',
+    'Assign ITSM permissions for Teams',
+    'Configure ITSM employee portal access',
+    'Set up a service agent in Agentforce and test it',
+    'Fix our Agentforce service agent in Service Cloud; it is broken',
+    'Configure employee records for IT Service',
+    'Configure runtime monitoring for IT Service',
+    'Set up Agentforce and test it. Service Cloud needs a generic agent',
+    'Configure Agentforce and test it; service agents need deployment',
+    'Configure Agentforce and test it! Service Cloud needs a generic agent',
+    'Configure Agentforce and test it? Service agents need deployment',
+]
 POSITIVES = {
+    'consumer-goods': [
+        'Set up TPE',
+        'Set up CG Cloud',
+        'Deploy the Consumer Goods TPM liability accrual data kit and schedule its accrual chain',
+        'Set up the TPE data kit',
+        'Set up the TPE data kit and Trade Promotion Effectiveness dashboards',
+        'Configure custom KPI measures for our TPE dashboards',
+        'Set up the RTR export of TPM promotion measures to Data Cloud for TPE',
+        'Configure Consumer Goods sync management and assign users to a sync configuration',
+        'Configure CG Cloud sync',
+        'Clone the TPE dashboards in Tableau Next for consumer goods',
+        'Set up trade promotion effectiveness',
+        'Set up trade promotion effectiveness analytics for our CPG company',
+        'Enable trade promotion management in my org',
+        'Create custom KPIs for TPE dashboards',
+        'Install the accruals data kit for trade promotions',
+        'Set up real time reporting export from Consumer Goods Cloud to Data Cloud',
+        'Deploy the CG Cloud trade promotion effectiveness data kit',
+    ],
     'education-cloud': [
         'Enable Education Cloud recruitment and admissions domains',
         'Generate an academic calendar with semester terms and sessions',
@@ -73,6 +120,20 @@ POSITIVES = {
         'Configure skills-based routing for Cases',
         'Configure Salesforce queue routing and agent capacity',
         'Deploy Salesforce presence statuses',
+    ],
+    'service-itsm': [
+        'Set up Agentforce for IT Service',
+        'Enable IT Service Agentforce Studio',
+        'Configure Employee agent for IT Service',
+        'Configure Fulfiller agent for IT Service',
+        'Assign ITSM Agentforce permissions',
+        'Assign IT Service Agentforce runtime access',
+        'Set up AGENTFORCE for IT SERVICE',
+        'Configure employee agent for IT-Service',
+        'Configure Employee agents for IT Service',
+        'Assign runtime access to IT Service agents',
+        'Configure ITSM Employee agents',
+        'Assign ITSM runtime access to agents',
     ],
 }
 
@@ -174,6 +235,106 @@ class PluginEvidenceTests(unittest.TestCase):
                     for name in TARGETS:
                         self.assertNotIn(name, output)
 
+    def test_consumer_goods_scope_regressions_across_all_real_surfaces(self):
+        name = 'consumer-goods'
+        self.assertIn(name, {plugin['name'] for plugin in self.data['plugins']})
+        positives = POSITIVES[name].copy()
+        negatives = [
+            'Set up CG',
+            'What is CG?',
+            'Set up trade promotion for B2B Commerce',
+            'Configure CG rendering for my graphics project',
+            'Set up CG lighting in Blender',
+            'Configure consumer account management',
+            'Build consumer goods inventory management',
+            'Configure promotion management for my Shopify store',
+            'Set up promotion effectiveness analytics for WooCommerce',
+            'Calculate accounting liability accruals',
+            'Configure liability accruals in SAP',
+            'Add a TPM promotion BO API workflow step',
+            'Configure the Consumer Goods TPM promotion BO API to copy promotions into the target org',
+            'Configure generic ecommerce promotions for my online store',
+            'Build a generic Data Cloud ingestion pipeline',
+            'Build a consumer data ingestion pipeline',
+            'Export consumer data to a CSV',
+            'Build a consumer analytics dashboard',
+            'Configure Consumer Goods Data Cloud ingestion',
+            'Create Data Cloud audience segments',
+            'Deploy a Data Cloud code extension',
+            'Author a Tableau Next dashboard from scratch',
+            'Fix generic mobile and offline sync for my field app',
+            'Create a Consumer Goods visit activity definition',
+            'Configure Consumer Goods visit activity account scoping',
+            'Deploy ecommerce promotion management for my B2C storefront',
+            'Configure real time reporting for a router RTR',
+            'Install a Data Cloud data kit',
+            'Configure KPIs for a Tableau Next dashboard',
+            'Deploy Salesforce metadata to my org',
+            'Set up an Agentforce agent',
+        ]
+        row = next(plugin for plugin in self.data['plugins'] if plugin['name'] == name)
+        positives += row['match']['examplePrompts']
+        surfaces = ('user-prompt', 'session-start', 'discovery-command', 'bypass-gate')
+        for prompt in positives:
+            with self.subTest(kind='positive-score', prompt=prompt):
+                self.assertTrue(self.context._plugin_prompt_requests_action(prompt))
+                self.assertIn(name, {match.plugin['name'] for match in self.score(prompt)
+                                     if match.band == 'high'})
+            for surface in surfaces:
+                with self.subTest(kind='positive-surface', prompt=prompt, surface=surface):
+                    self.assertIn(name, self.surfaced(prompt, surface))
+        for prompt in negatives:
+            for anchors in (True, False):
+                with self.subTest(kind='negative-score', prompt=prompt, anchors=anchors):
+                    self.assertNotIn(name, {match.plugin['name']
+                                            for match in self.score(prompt, anchors)})
+            for surface in surfaces:
+                with self.subTest(kind='negative-surface', prompt=prompt, surface=surface):
+                    self.assertNotIn(name, self.surfaced(prompt, surface))
+
+    def test_consumer_goods_bare_product_information_and_commerce_neighbor(self):
+        for prompt in ['What is TPE?', 'Explain TPE', 'What is CG Cloud?',
+                       'Tell me about CG Cloud']:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(self.context._plugin_prompt_requests_action(prompt))
+                self.assertNotIn('consumer-goods', self.surfaced(prompt, 'user-prompt'))
+                self.assertIn('consumer-goods', self.surfaced(prompt, 'discovery-command'))
+        prompt = 'Set up trade promotion for B2B Commerce'
+        for surface in ('user-prompt', 'session-start', 'discovery-command', 'bypass-gate'):
+            with self.subTest(surface=surface):
+                output = self.surfaced(prompt, surface)
+                self.assertNotIn('consumer-goods', output)
+                self.assertIn('commerce-b2b', output)
+
+    def test_clone_requests_keep_information_and_homographs_out_of_prompt_surface(self):
+        for prompt in [
+            'Please clone the TPE dashboards in Tableau Next for consumer goods',
+            'Can you clone the TPE dashboards in Tableau Next for consumer goods?',
+        ]:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(self.context._plugin_prompt_requests_action(prompt))
+                self.assertIn('consumer-goods', self.surfaced(prompt, 'user-prompt'))
+        for prompt in [
+            'Explain how to clone the TPE dashboards for consumer goods',
+            'What is a clone of the TPE dashboards for consumer goods?',
+            'Clone settings for the TPE dashboards are incorrect',
+            'Clone failed in Tableau Next for consumer goods TPE dashboards',
+        ]:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(self.context._plugin_prompt_requests_action(prompt))
+                self.assertNotIn('consumer-goods', self.surfaced(prompt, 'user-prompt'))
+
+    def test_itsm_unrelated_requests_never_match_or_surface(self):
+        if 'service-itsm' not in self.present:
+            self.skipTest('IT Service plugin is not in this catalog')
+        for prompt in ITSM_NEGATIVES:
+            for anchors in (True, False):
+                with self.subTest(prompt=prompt, anchors=anchors):
+                    self.assertNotIn('service-itsm', {m.plugin['name'] for m in self.score(prompt, anchors)})
+            for surface in ('user-prompt', 'session-start', 'discovery-command', 'bypass-gate'):
+                with self.subTest(prompt=prompt, surface=surface):
+                    self.assertNotIn('service-itsm', self.surfaced(prompt, surface))
+
     def test_supported_and_curated_requests_pass_action_gate_and_surface(self):
         for name in self.present:
             row = next(p for p in self.data['plugins'] if p['name'] == name)
@@ -208,10 +369,23 @@ class PluginEvidenceTests(unittest.TestCase):
                 self.assertFalse(self.context._plugin_prompt_requests_action(prompt))
                 self.assertNotIn('service-omni', self.surfaced(prompt, 'user-prompt'))
 
+    def test_itsm_neighbors_keep_their_supported_recommendations(self):
+        for name, prompt in [
+            ('agentforce-adlc', 'Test my Agentforce agent and fix it'),
+            ('agentforce-adlc', 'Deploy the Agentforce agent, then publish it'),
+            ('service-engagement', 'Route Omni-Channel work items to agents'),
+        ]:
+            for surface in ('user-prompt', 'session-start', 'discovery-command', 'bypass-gate'):
+                with self.subTest(plugin=name, prompt=prompt, surface=surface):
+                    self.assertIn(name, self.surfaced(prompt, surface))
+
     def test_information_only_prompt_scores_but_does_not_proactively_surface(self):
         for name in self.present:
-            prompt = 'What is ' + ('an academic calendar with semester terms?' if name == 'education-cloud'
-                                   else 'Omni queue routing and presence?')
+            topic = ('an academic calendar with semester terms?' if name == 'education-cloud'
+                     else 'TPE?' if name == 'consumer-goods'
+                     else 'Agentforce for IT Service setup?' if name == 'service-itsm'
+                     else 'Omni queue routing and presence?')
+            prompt = 'What is ' + topic
             self.assertIn(name, {m.plugin['name'] for m in self.score(prompt)})
             self.assertFalse(self.context._plugin_prompt_requests_action(prompt))
             self.assertNotIn(name, self.surfaced(prompt, 'user-prompt'))
@@ -281,18 +455,25 @@ class PluginEvidenceTests(unittest.TestCase):
 
     def test_optional_policy_preserves_scores_and_legacy_anchor_bypass(self):
         for row in self.data['plugins']:
-            if row['name'] not in self.present:
+            if row['name'] == 'consumer-goods':
+                self.assertIs(row['match'].get('enforceAnchorsOnAllSurfaces'), True)
+            elif row['name'] not in self.present:
                 self.assertNotIn('enforceAnchorsOnAllSurfaces', row['match'])
-        before = copy.deepcopy(self.data)
-        for row in before['plugins']:
-            row['match'].pop('enforceAnchorsOnAllSurfaces', None)
-        for name in self.present:
-            prompt = POSITIVES[name][0]
+        policies = {row['name'] for row in self.data['plugins']
+                    if row['match'].get('enforceAnchorsOnAllSurfaces')}
+        for name in self.present | policies:
+            before = copy.deepcopy(self.data)
+            for row in before['plugins']:
+                if row['name'] == name:
+                    row['match'].pop('enforceAnchorsOnAllSurfaces', None)
+            target = next(row for row in self.data['plugins'] if row['name'] == name)
+            prompt = POSITIVES[name][0] if name in POSITIVES else target['match']['examplePrompts'][0]
             old = self.catalog.score_prompt_against_catalog(prompt, before, require_anchor_terms=False)
             new = self.catalog.score_prompt_against_catalog(prompt, self.data, require_anchor_terms=False)
-            old = {m.plugin['name']: (m.score,m.band) for m in old}
-            for m in new:
-                self.assertEqual(old[m.plugin['name']], (m.score,m.band))
+            # Changing one policy must preserve all scores on its supported request.
+            self.assertEqual(
+                {m.plugin['name']: (m.score, m.band) for m in old},
+                {m.plugin['name']: (m.score, m.band) for m in new})
         row = copy.deepcopy(self.data['plugins'][0])
         row['match'] = {'description':'Unique task vocabulary', 'keywords':['unique'],
                         'examplePrompts':['Create a unique task'], 'anchorTerms':['absent']}

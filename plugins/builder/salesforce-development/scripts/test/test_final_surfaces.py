@@ -16,7 +16,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from _test_support import load_module, strip_ansi
+from _test_support import isolate_host_markers, load_module, strip_ansi
+
+
+def setUpModule():
+    isolate_host_markers()
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 PLUGIN_ROOT = SCRIPTS.parent
@@ -2407,7 +2411,13 @@ class TerminalRenderingSafetyTests(unittest.TestCase):
         banner = sfx.render_banner_block(color=False, facts=hostile_facts)
         normal_banner = sfx.render_banner_block(color=False, facts={
             "version": "1.0", "installedPlugins": 1, "availablePlugins": 1})
-        env = "\n".join(sfx.render_environment_band(org, self.HOSTILE, False))
+        # Pin optional grounding and H360 guidance: their real text wraps and depends
+        # on local opt-in/health. This test isolates line injection in the org/MCP inputs.
+        with mock.patch.object(sfx, "_h360_status_row", return_value={
+                "status": "info", "message": "Optional; disabled locally"}), \
+                mock.patch.object(sfx, "_grounding_status_row", return_value={
+                    "status": "info", "message": "Optional; not yet checked"}):
+            env = "\n".join(sfx.render_environment_band(org, self.HOSTILE, False))
         proj = "\n".join(sfx.render_project_band(project, stats, self.HOSTILE, False))
         report = {"tools": [{"name": self.HOSTILE, "status": "critical",
                               "version": self.HOSTILE, "message": self.HOSTILE}]}
@@ -2440,7 +2450,9 @@ class TerminalRenderingSafetyTests(unittest.TestCase):
                 self.assertNotIn("\u2066", surface)
                 self.assertNotIn("## INJECTED\n", surface)
         self.assertEqual(len(banner.splitlines()), len(normal_banner.splitlines()))
-        self.assertEqual(len(env.splitlines()), 5)
+        self.assertEqual(len(env.splitlines()), 7)  # five original lines plus fixed Grounding and H360 rows
+        self.assertIn("Grounding: Optional; not yet checked", env)
+        self.assertIn("H360: Optional; disabled locally", env)
         self.assertEqual(len(proj.splitlines()), 5)
 
     def test_scratch_near_expiry_hostile_alias_is_also_sanitized_at_render(self):
@@ -2658,7 +2670,7 @@ class ReadinessBannerTests(unittest.TestCase):
              "message": "Non-LTS release; prefer an even LTS"},
             {"name": "NPM", "status": "ok", "version": "11.11.0", "message": "Installed"},
             {"name": "Git", "status": "ok", "version": "git version 2.50.1", "message": "Installed"},
-            {"name": "Salesforce MCP (config)", "status": "ok", "message": "api-context · lsp"},
+            {"name": "Salesforce MCP (config)", "status": "ok", "message": "metadata-experts · lsp"},
             {"name": "Salesforce MCP (endpoint)", "status": "warn", "message": "No org configured yet"},
             {"name": "Salesforce MCP (process)", "status": "info", "message": "Confirm with /mcp or /doctor"},
             {"name": "Source Tracking", "status": "warn", "message": "No org configured yet"},

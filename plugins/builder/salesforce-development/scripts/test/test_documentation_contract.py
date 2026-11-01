@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release documentation and design-link contracts for plugin 2.5.0."""
+"""Release documentation and design-link contracts for the plugin."""
 from __future__ import annotations
 
 import json
@@ -24,11 +24,12 @@ class DocumentationContractTests(unittest.TestCase):
         return path.read_text(encoding="utf-8")
 
     def test_release_version_minimum_and_changelog_are_reconciled(self):
-        plugin = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "2.5.0")
+        # The release cron sets the version, so read it rather than pin it.
+        version = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["version"]
+        self.assertRegex(version, r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
         readme = self.text(README)
         self.assertIn("Claude Code 2.1.222 or later", readme)
-        self.assertIn("## [2.5.0]", self.text(CHANGELOG))
+        self.assertIn(f"## [{version}]", self.text(CHANGELOG))
 
     def test_current_docs_share_the_six_stage_contract(self):
         paths = [README, DESIGN / "README.md", DESIGN / "headless-360-pov.md",

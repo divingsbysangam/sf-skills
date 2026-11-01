@@ -7,6 +7,7 @@ metadata:
   minApiVersion: "66.0"
   relatedSkills:
     - "platform-apex-generate"
+    - "integration-apex-symbol-table-query"
   cliTools:
     - tool: ["sf"]
       semver: ">=2.0.0"
@@ -51,7 +52,7 @@ Always wrap the code under test in `Test.startTest()` / `Test.stopTest()`:
 
 Before generating or fixing tests, identify:
 
-- the target production class(es) under test
+- the target production class(es) under test; use the `integration-apex-symbol-table-query` skill to get their exact method signatures, fields, and inner types rather than inferring them. If the org does not support it (API v67.0+ required) or the call fails, read the source instead
 - existing test classes, test data factories, and setup helpers
 - desired test scope (single class, specific methods, suite, or local tests)
 - coverage threshold (75% minimum for deploy, 90%+ recommended)
@@ -156,6 +157,7 @@ Focus on:
 - uncovered lines and weak coverage areas
 - whether failures indicate bad test data, brittle assertions, or broken production logic
 - when class metadata crosses from versions 66.0 and below to 67.0 and above, check explicit sharing, decide user/system mode per operation, grant required CRUD/FLS in test users or permission sets, and rerun affected tests
+- `INVALID_CROSS_REFERENCE_KEY` on a `RecordTypeId` at API 67.0+ means the running user lacks that record type — grant it via a permission set and run the DML in `System.runAs` (see [references/test-data-factory.md](references/test-data-factory.md#record-type-availability-api-670))
 
 ### Step 5 — Fix Loop
 
@@ -203,7 +205,7 @@ Load on demand for detailed patterns:
 
 | Reference | When to use |
 |-----------|-------------|
-| [references/test-data-factory.md](references/test-data-factory.md) | TestDataFactory patterns, field overrides, duplicate rule handling |
+| [references/test-data-factory.md](references/test-data-factory.md) | TestDataFactory patterns, field overrides, record type availability, duplicate rule handling |
 | [references/assertion-patterns.md](references/assertion-patterns.md) | Assertion best practices, anti-patterns, common pitfalls |
 | [references/mocking-patterns.md](references/mocking-patterns.md) | HttpCalloutMock, DML mocking, StubProvider, SOSL, Email, Platform Events |
 | [references/async-testing.md](references/async-testing.md) | Batch, Queueable, Future, Scheduled job testing |

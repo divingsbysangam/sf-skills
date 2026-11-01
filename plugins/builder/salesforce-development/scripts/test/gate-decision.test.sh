@@ -82,6 +82,10 @@ decision allow "dry-run against trial → allow" \
   "sf project deploy start --dry-run -o mytrial" \
   '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://my.develop.my.salesforce.com"}}'
 
+decision allow "dry-run against demo org → allow" \
+  "sf project deploy start --dry-run -o mydemo" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.demo.my.salesforce.com"}}'
+
 decision allow "sandbox → allow" \
   "sf project deploy start --target-org sbx" \
   '{"result":{"isSandbox":true,"instanceUrl":"https://acme--dev.sandbox.my.salesforce.com"}}'
@@ -99,6 +103,22 @@ decision deny "production → deny" \
 decision allow "production + CONFIRM_PROD=1 → allow" \
   "CONFIRM_PROD=1 sf project deploy start --target-org prod" \
   '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}'
+
+# --- Quick deploy (the platform-metadata-deploy production promotion) --------
+# The gate is scoped to start|quick, so a bare prod `deploy quick` is denied and
+# only the confirmed form (CONFIRM_PROD=1) is allowed — this is the marker the
+# skill emits after the user's literal "yes". Non-prod quick is never gated.
+decision deny "quick → prod → deny (bare)" \
+  "sf project deploy quick --job-id 0Af000 --target-org prod" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}'
+
+decision allow "quick + CONFIRM_PROD=1 → prod → allow" \
+  "CONFIRM_PROD=1 sf project deploy quick --job-id 0Af000 --target-org prod" \
+  '{"result":{"isSandbox":false,"isScratch":false,"instanceUrl":"https://acme.my.salesforce.com"}}'
+
+decision allow "quick → sandbox → allow (not gated)" \
+  "sf project deploy quick --job-id 0Af000 --target-org sbx" \
+  '{"result":{"isSandbox":true,"instanceUrl":"https://acme--dev.sandbox.my.salesforce.com"}}'
 
 # --- Destructive-changes deploys (#407) -------------------------------------
 # A destructiveChanges manifest reaches the gate as an ordinary deploy, but has

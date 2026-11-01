@@ -14,6 +14,7 @@ REQUIRED_FILES = frozenset({
     ".codex-plugin/plugin.json",
     ".mcp.json",
     "scripts/codex_mcp_launcher.py",
+    "scripts/codex_h360_bootstrap.py",
     "scripts/codex_hooks.py",
     "scripts/codex_edit_advisory.py",
     "scripts/codex_startup.py",
@@ -32,7 +33,8 @@ REQUIRED_FILES = frozenset({
     "catalog/plugins.json",
 })
 EXPECTED_SERVERS = frozenset({
-    "salesforce-api-context", "salesforce-metadata-experts", "salesforce-lsp",
+    "salesforce-metadata-experts", "salesforce-metadata-grounding",
+    "salesforce-headless-360", "salesforce-lsp",
 })
 EXPECTED_COMMANDS = frozenset({
     "discover", "feedback", "login", "logout", "org", "plugin-install",
@@ -106,7 +108,13 @@ def verify(plugin_root: Path, require_command_projection: bool = False) -> dict[
                 failures.append("migrated feedback surface lost its unsupported boundary")
     servers = codex.get("mcpServers")
     if not isinstance(servers, dict) or set(servers) != EXPECTED_SERVERS:
-        failures.append("Codex MCP server set differs from the supported three-server set")
+        failures.append("Codex MCP server set differs from the supported server set")
+    else:
+        h360 = servers["salesforce-headless-360"]
+        bootstrap = root / "scripts/codex_h360_bootstrap.py"
+        if bootstrap.is_file() and h360.get("args") != [
+                "-I", "-c", bootstrap.read_text(encoding="utf-8"), "salesforce-headless-360"]:
+            failures.append("Codex H360 bootstrap differs from its source")
 
     file_count = 0
     for directory, directory_names, file_names in os.walk(root, followlinks=False):

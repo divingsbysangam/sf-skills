@@ -14,6 +14,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+from _test_support import isolate_host_markers
+
+
+def setUpModule():
+    isolate_host_markers()
+
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PLUGIN_ROOT.parents[2]
@@ -39,12 +45,19 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(claude["version"], codex["version"])
         self.assertEqual("./skills/", codex["skills"])
         self.assertEqual(
-            {"salesforce-api-context", "salesforce-metadata-experts", "salesforce-lsp"},
+            {"salesforce-metadata-experts", "salesforce-metadata-grounding", "salesforce-headless-360", "salesforce-lsp"},
             set(codex["mcpServers"]),
         )
         for name, server in codex["mcpServers"].items():
             self.assertEqual("python3", server["command"])
-            self.assertEqual(["scripts/codex_mcp_launcher.py", name], server["args"])
+            if name == "salesforce-headless-360":
+                self.assertEqual(["-I", "-c"], server["args"][:2])
+                self.assertEqual([name], server["args"][3:])
+                self.assertNotIn("cwd", server)
+            else:
+                self.assertEqual(["scripts/codex_mcp_launcher.py", name], server["args"])
+        h360 = codex["mcpServers"]["salesforce-headless-360"]
+        self.assertIn("SF_HEADLESS_360_ENABLED", h360["env_vars"])
         self.assertFalse(
             (PLUGIN_ROOT / "hooks/hooks.json").exists(),
             "a conventional second hook manifest would also be auto-loaded by Claude",
@@ -88,6 +101,39 @@ class ManifestTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_thread_cwd_wins_over_stale_desktop_environment(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            plugin = root / "plugin"
+            active = root / "active"
+            stale = root / "stale"
+            for path in (plugin, active, stale):
+                path.mkdir()
+            for path in (active, stale):
+                (path / "sfdx-project.json").write_text("{}")
+            env = {"PWD": str(stale), "INIT_CWD": str(stale)}
+            self.assertEqual(active.resolve(), launcher.resolve_project_cwd(
+                plugin_root=plugin, environment=env, process_cwd=active))
+            (active / "sfdx-project.json").unlink()
+            self.assertIsNone(launcher.resolve_project_cwd(
+                plugin_root=plugin, environment=env, process_cwd=active))
+            self.assertIsNone(launcher.resolve_project_cwd(
+                plugin_root=plugin,
+                environment={**env, "CODEX_WORKSPACE_ROOT": str(active)},
+                process_cwd=stale))
+
+    def test_disabled_h360_launcher_does_not_require_a_project_or_org(self):
+        with mock.patch.dict(launcher.os.environ, {}, clear=True), \
+                mock.patch.object(launcher, "_saved_headless_360_enabled", return_value=False), \
+                mock.patch.object(launcher, "resolve_node", return_value="/test/bin/node"), \
+                mock.patch.object(launcher.os, "execvp") as execvp:
+            self.assertEqual(0, launcher.main(["salesforce-headless-360"]))
+        args = execvp.call_args.args[1]
+        self.assertEqual("/test/bin/node", args[0])
+        self.assertTrue(args[1].endswith("sf-headless-360-optin.js"))
+        self.assertTrue(args[2].endswith("sf-mcp-proxy.bundled.js"))
+        self.assertEqual("headless-360", args[3])
+
     def test_target_org_requires_one_explicit_value(self):
         self.assertIsNone(launcher.resolve_target_org({}))
         self.assertIsNone(launcher.resolve_target_org({
@@ -126,7 +172,7 @@ class LauncherTests(unittest.TestCase):
             with mock.patch.dict(launcher.os.environ, {"CODEX_WORKSPACE_ROOT": str(project)},
                                  clear=True), \
                     mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as stderr:
-                self.assertEqual(2, launcher.main(["salesforce-api-context"]))
+                self.assertEqual(2, launcher.main(["salesforce-metadata-experts"]))
             self.assertIn("sf config set target-org", stderr.getvalue())
             self.assertIn("SF_TARGET_ORG", stderr.getvalue())
 
@@ -221,11 +267,12 @@ class LauncherTests(unittest.TestCase):
             }
             with mock.patch.dict(launcher.os.environ, env, clear=True), mock.patch.object(
                 launcher.os, "chdir"
-            ) as chdir, mock.patch.object(launcher.os, "execvp", side_effect=OSError("stop")) as execvp:
-                self.assertEqual(2, launcher.main(["salesforce-api-context"]))
+            ) as chdir, mock.patch.object(launcher, "resolve_node", return_value="/test/bin/node"), \
+                    mock.patch.object(launcher.os, "execvp", side_effect=OSError("stop")) as execvp:
+                self.assertEqual(2, launcher.main(["salesforce-metadata-experts"]))
                 self.assertEqual("scratch", launcher.os.environ["SFDX_TARGET_ORG"])
             chdir.assert_called_once_with(project.resolve())
-            self.assertEqual("node", execvp.call_args.args[0])
+            self.assertEqual("/test/bin/node", execvp.call_args.args[0])
 
 
 
@@ -372,6 +419,91 @@ class CodexRecommendationBoundaryTests(unittest.TestCase):
                         self.assertIn("end-to-end Codex workflows are not yet verified", error.getvalue())
                     else:
                         install.assert_called_once_with(name, entry, "codex:thread", "codex")
+
+
+_AMBIENT_HOST_KEYS = (
+    "SF_AGENT_CLIENT", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_HOME",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CONFIG_DIR",
+)
+
+
+class CodexHostInferenceStateTests(unittest.TestCase):
+    """W-24599110: Codex is recognised from its own env markers alone (no
+    SF_AGENT_CLIENT), and plugins enabled only in Claude's settings.json are
+    not treated as installed there. Ambient host markers are cleared so the
+    result is identical inside a Claude Code session and in CI."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.home = self.root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        (self.home / ".claude" / "settings.json").write_text(
+            json.dumps({"enabledPlugins": {"experience-react@salesforce": True}}),
+            encoding="utf-8")
+        self.codex_home = self.root / "codex-home"
+        self.codex_home.mkdir()
+        env = {k: v for k, v in os.environ.items() if k not in _AMBIENT_HOST_KEYS}
+        env["HOME"] = str(self.home)
+        env["CODEX_HOME"] = str(self.codex_home)
+        for patch in (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sf_context, "_plugin_root",
+                              return_value=str(self.root / "worktree-plugin")),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _no_codex_cli(self):
+        return mock.patch.object(
+            sf_context.subprocess, "run",
+            return_value=mock.Mock(returncode=0, stdout='{"installed": []}'))
+
+    def test_codex_detected_from_thread_id_without_sf_agent_client(self):
+        for marker in ("CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+            with self.subTest(marker=marker), mock.patch.dict(os.environ, {marker: "t1"}):
+                self.assertNotIn("SF_AGENT_CLIENT", os.environ)
+                self.assertEqual("codex", sf_context._inferred_plugin_host())
+                self.assertEqual("codex", sf_context._plugin_client())
+                self.assertEqual("codex", sf_context._plugin_state_host())
+
+    def test_codex_detected_from_plugin_root_under_codex_plugin_cache(self):
+        cached = self.codex_home / "plugins" / "cache" / "mkt" / "salesforce-development"
+        cached.mkdir(parents=True)
+        with mock.patch.object(sf_context, "_plugin_root", return_value=str(cached)):
+            self.assertEqual("codex", sf_context._inferred_plugin_host())
+            self.assertEqual("codex", sf_context._plugin_state_host())
+
+    def test_claude_only_enabled_plugin_is_not_installed_under_codex_markers(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1"}), self._no_codex_cli():
+            enabled = sf_context._enabled_plugin_names()
+        self.assertNotIn("experience-react", enabled or set())
+
+    def test_codex_own_config_is_the_install_source_under_codex_markers(self):
+        if sf_context.tomllib is None:
+            self.skipTest("tomllib unavailable")
+        (self.codex_home / "config.toml").write_text(
+            '[plugins."service-engagement@mkt"]\nenabled = true\n', encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1"}):
+            self.assertEqual({"service-engagement"}, sf_context._enabled_plugin_names())
+
+    def test_codex_marker_beats_a_stale_claude_client_claim(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1", "SF_AGENT_CLIENT": "claude"}):
+            self.assertEqual("unknown", sf_context._plugin_state_host())
+            self.assertIsNone(sf_context._enabled_plugin_names())
+
+    def test_claude_default_without_markers_still_reads_claude_settings(self):
+        os.environ.pop("CODEX_HOME")
+        self.assertEqual("claude", sf_context._plugin_state_host())
+        self.assertEqual({"experience-react"}, sf_context._enabled_plugin_names())
+
+    def test_conflicting_markers_do_not_read_claude_settings(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t1", "CLAUDECODE": "1"}), \
+                mock.patch("pathlib.Path.read_text", side_effect=AssertionError("read settings")):
+            self.assertEqual("unknown", sf_context._plugin_state_host())
+            self.assertIsNone(sf_context._enabled_plugin_names())
 
 
 class RealCatalogHostTests(unittest.TestCase):
@@ -895,6 +1027,13 @@ class NaturalLanguageInstallRoutingTests(unittest.TestCase):
             self.assertTrue(sf_context._plugin_prompt_requests_action(prompt), prompt)
         for prompt in ("Let's talk about Apex", "let's see what happens"):
             self.assertFalse(sf_context._plugin_prompt_requests_action(prompt), prompt)
+
+    def test_recommendations_adapter_escalates_preference_writes(self):
+        # off/on/set write ~/.sf, outside the workspace-write sandbox (W-24599110).
+        body = (PLUGIN_ROOT / "codex-commands" / "plugin-recommendations.md").read_text(
+            encoding="utf-8")
+        self.assertIn('sandbox_permissions="require_escalated"', body)
+        self.assertIn("status only reads and needs no escalation", body)
 
     def test_codex_route_notes_request_escalation_only_on_codex(self):
         codex = sf_context._plugin_install_route_note("experience-react", client="codex")

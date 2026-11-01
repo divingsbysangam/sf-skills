@@ -1,0 +1,26 @@
+{
+  "name": "service-itsm",
+  "version": "0.1.0",
+  "description": "Set up the initial Agentforce for IT Service foundation: enable and validate Agentforce Studio, configure Employee and Fulfiller agents, assign ITSM Agentforce permissions, and grant agent runtime access.",
+  "author": {
+    "name": "Salesforce"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "Agentforce for IT Service",
+    "IT Service Agentforce setup",
+    "Agentforce Studio ITSM",
+    "Employee agent ITSM",
+    "Fulfiller agent ITSM",
+    "ITSM Agentforce permission sets",
+    "Agentforce runtime access"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Salesforce IT Service Agentforce Setup",
+    "shortDescription": "Set up Agentforce for IT Service",
+    "developerName": "Salesforce",
+    "category": "Developer Tools",
+    "websiteURL": "https://github.com/forcedotcom/sf-skills"
+  }
+}

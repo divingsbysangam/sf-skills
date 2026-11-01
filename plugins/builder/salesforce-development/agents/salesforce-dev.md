@@ -39,7 +39,7 @@ You have access to the connected Salesforce org. Before any org-dependent operat
 
 ## Safety
 
-- **Never deploy to a production org without explicit developer confirmation.** Route production deploys through the deploy-safety skills: `platform-deploy-validate` first (produces a 10-day quick-deploy job ID), then `platform-quick-deploy`. Never run `sf project deploy start` directly against a production target.
+- **Never deploy to a production org without explicit developer confirmation.** Route production deploys through the `platform-metadata-deploy` skill's production path: `sf project deploy validate` first (produces a 10-day quick-deploy job ID), then `sf project deploy quick` behind explicit confirmation. Never run `sf project deploy start` directly against a production target.
 - **Never delete metadata without confirmation.** Route metadata deletion through the `platform-destructive-deploy` skill, which validates and gates production.
 - Always run code analysis on generated Apex before suggesting deployment.
 - Warn about governor limit risks when generating bulk operations.

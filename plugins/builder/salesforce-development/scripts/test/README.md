@@ -50,6 +50,7 @@ trial/dev orgs that were previously mis-classified as production:
 - OrgFarm trials (`orgfarm-*`, `*.develop.my.salesforce.com`) with `isSandbox`/
   `isScratch` returning `null`
 - internal `*.pc-rnd.*` dev hosts
+- demo orgs on the demo partition (`*.demo.my.salesforce.com`)
 - any org carrying a `trialExpirationDate`
 
 and the guard that genuine production (`*.my.salesforce.com`, classic
@@ -89,8 +90,8 @@ one nudge per session; `record-feedback-decision` persists the opt-in. Every
 response is non-blocking.
 
 **`post-deploy-failure.test.sh`** (#405) — a failed `sf project deploy
-start`/`validate`/`quick` routes to its owning skill
-(`platform-metadata-deploy` / `platform-deploy-validate` / `platform-quick-deploy`);
+start`/`validate`/`quick` all route to `platform-metadata-deploy`, which owns
+the whole deploy workflow (the prod-path validate → quick-deploy included);
 non-deploy or garbled payloads stay silent (fail-open); never blocks. This suite
 guards the skill-name references that a skill rename must keep in lockstep.
 
@@ -265,8 +266,9 @@ kinds of change were required, both mechanical:
 2. **Skill names + markers:** the advisory/routing suites assert the owning skill
    by name, and this repo renamed the source's gerund skills to the
    `<domain>-<verb>` taxonomy (e.g. `generating-apex` → `platform-apex-generate`,
-   `deploying-metadata` → `platform-metadata-deploy`, `quick-deploying-to-prod`
-   → `platform-quick-deploy`). Compaction re-inject markers were rebranded
+   `deploying-metadata` → `platform-metadata-deploy`; the source's
+   `quick-deploying-to-prod` and validate skills were later folded into
+   `platform-metadata-deploy`'s production path). Compaction re-inject markers were rebranded
    `sfdx-core` → `salesforce-development`. Expected values track the strings
    `sf_context.py` actually emits in this repo.
 

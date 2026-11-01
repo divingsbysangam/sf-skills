@@ -46,6 +46,7 @@ import urllib.request
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -195,7 +196,8 @@ def _check_tools_workers() -> int:
 # contract; `run_result()` preserves the failure reason for the org/status paths
 # (W-23466800 / WIN-027: a broken CLI must not masquerade as "no org configured").
 #   reason: "" (ok) | "empty" | "unresolved" | "timeout" | "nonzero" | "error"
-RunResult = namedtuple("RunResult", ["ok", "stdout", "returncode", "reason"])
+# stderr is retained for explicit diagnostic classification, never printed wholesale.
+RunResult = namedtuple("RunResult", ["ok", "stdout", "returncode", "reason", "stderr"], defaults=[""])
 
 
 def run_result(cmd: list, timeout: Optional[int] = None) -> RunResult:
@@ -225,13 +227,13 @@ def run_result(cmd: list, timeout: Optional[int] = None) -> RunResult:
             shell=False,
             env=_shim.no_color_env(),
         )
-    except subprocess.TimeoutExpired:
-        return RunResult(False, "", None, "timeout")
+    except subprocess.TimeoutExpired as exc:
+        return RunResult(False, "", None, "timeout", exc.stderr or "")
     except (FileNotFoundError, OSError):
         return RunResult(False, "", None, "error")
     if result.returncode == 0:
-        return RunResult(True, result.stdout, 0, "")
-    return RunResult(False, result.stdout, result.returncode, "nonzero")
+        return RunResult(True, result.stdout, 0, "", result.stderr or "")
+    return RunResult(False, result.stdout, result.returncode, "nonzero", result.stderr or "")
 
 
 def run(cmd: list, timeout: Optional[int] = None) -> str:
@@ -263,6 +265,7 @@ def _active_shell() -> str:
     return os.environ.get("SHELL", "")
 
 
+@lru_cache(maxsize=1)
 def _plugin_root() -> str:
     """Absolute path to the plugin root (parent of scripts/)."""
     return str(Path(__file__).resolve().parent.parent)
@@ -880,7 +883,7 @@ If you start to handle a request without checking skills, STOP and re-evaluate. 
 
 # The single user-facing pointer to the discovery surface. Reused verbatim as the
 # banner/wayfinder CTA (so exactly one pointer shows) and as the closing line of
-# SKILLS_FIRST_REINJECT below.
+# _skills_first_reinject() below.
 DISCOVERY_POINTER = 'Ask “what can I do here?” or run /salesforce-development:discover.'
 
 
@@ -912,6 +915,58 @@ dispatch it before writing code, metadata, or raw commands. Resolution hierarchy
 3. SF CLI with `--json` only when no skill or plugin match covers it;
 4. direct API only when none of those fit.
 """
+
+
+# Addressed to the model, like ORIENTATION_DIRECTIVE, so it rides `additionalContext` only.
+#
+# Why it exists: an org's caps and Setup settings can differ from the documented defaults, and
+# the hierarchy above lets a partial answer stop at tier 1. Seen in an end-to-end run — asked
+# "How many more fields can I track on Case?", the SOQL skill counted the 17 tracked fields
+# correctly, then filled the cap from documentation (20, so "3 more") in an org whose cap is
+# 200. Asked to verify through Headless 360, the model re-sent the same SOQL and repeated
+# "3 more"; H360 `discover` finds a recipe that can read the cap, then `dispatch_readonly` reads
+# the org value. SessionStart can't know whether H360 is connected (MCP servers connect
+# separately). Local opt-in selects the H360 variant, whose clause still requires
+# tools to be present. When the user hasn't opted in to H360, the H360 clause is dropped so the model never goes looking
+# for tools that can't be connected; the rest of the rule still applies.
+ORG_VALUES_DIRECTIVE = """Org values: never take from docs or defaults. Read with a skill or `sf`; if Headless 360
+tools are present, `discover` finds a candidate, not a value; `describe` it, then read with
+`dispatch_readonly`. Otherwise say unverified.
+"""
+ORG_VALUES_DIRECTIVE_NO_H360 = """Org values: never take from docs or defaults. Read with a skill or `sf`;
+otherwise say unverified.
+"""
+
+
+@lru_cache(maxsize=1)
+def _codex_h360_launcher():
+    """Load the bundled local-preference reader without running its CLI entrypoint."""
+    import importlib.util
+    path = Path(__file__).resolve().with_name("codex_mcp_launcher.py")
+    spec = importlib.util.spec_from_file_location("_h360_codex_launcher", path)
+    if spec is None or spec.loader is None:
+        return None
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (OSError, ImportError, SyntaxError, RecursionError):
+        return None
+
+
+def _headless_360_enabled() -> bool:
+    """Keep host guidance in sync with the preference used by its MCP launcher."""
+    if _plugin_client() == "codex":
+        module = _codex_h360_launcher()
+        return module._headless_360_enabled(dict(os.environ)) if module else False
+    # Claude's MCP manifest sets SF_HEADLESS_360_ENABLED from the plugin option,
+    # overriding any inherited shell value. Only the option is evidence for hooks.
+    value = os.environ.get("CLAUDE_PLUGIN_OPTION_HEADLESS_360_ENABLED", "")
+    return value.strip().lower() in ("1", "true", "enabled", "on")
+
+
+def _org_values_directive() -> str:
+    return ORG_VALUES_DIRECTIVE if _headless_360_enabled() else ORG_VALUES_DIRECTIVE_NO_H360
 
 
 def _session_model_context(
@@ -974,6 +1029,7 @@ def _session_model_context(
         f"next action: {_clip(_nudge_next_action_text(candidate), 88)}",
         f"discovery: {_host_text(DISCOVERY_POINTER)}",
         SKILLS_FIRST_COMPACT.strip(),
+        _org_values_directive().strip(),
         ORIENTATION_DIRECTIVE.strip(),
     ]
     return "\n".join(lines)
@@ -985,18 +1041,20 @@ def _session_model_context(
 # compaction reclaims context, keeping skills-first DURABLE across the long,
 # complex sessions where skills matter most rather than evaporating the moment
 # context is summarized.
-SKILLS_FIRST_REINJECT = """salesforce-development durable context after compaction:
-The installed Salesforce skill catalog remains active.
+_SKILLS_FIRST_REINJECT_TEMPLATE = """salesforce-development durable context after compaction:
+Skills first: explicitly dispatch the installed owning skill before writing code,
+metadata, or commands. Order: installed skill; uninstalled plugin match (propose
+install, wait for confirmation); SF CLI with `--json` if neither covers the task;
+direct API only if none fit.
 
-Skills first (required): match Salesforce work to an installed owning skill and
-explicitly dispatch it before writing code, metadata, or raw commands.
-Resolution hierarchy: 1. installed Skill; 2. uninstalled plugin match (propose
-install, wait for confirmation); 3. SF CLI with `--json` only when no skill or
-plugin match covers the operation; 4. direct API only when none of those fit.
-
+{org_values}
 Ask “what can I do here?” or run /salesforce-development:discover.
 
 """ + ORIENTATION_DIRECTIVE
+
+
+def _skills_first_reinject() -> str:
+    return _SKILLS_FIRST_REINJECT_TEMPLATE.replace("{org_values}", _org_values_directive())
 
 
 # The Headless 360 lockup: FIGlet ANSI Shadow. The block art spells SALESFORCE at
@@ -1699,6 +1757,8 @@ def _mcp_indicator(mcp_status: str) -> tuple[str, str]:
     low = mcp_status.lower()
     # Partial = some tracked servers healthy, at least one down. Its own glyph so a
     # half-working feature reads differently from both healthy and a full outage.
+    if "blocked by codex network policy" in low:
+        return "⚠ check blocked", "warn"
     if "partial" in low:
         return "⚠ partial", "warn"
     if "connected" in low or "active" in low:
@@ -1734,14 +1794,14 @@ def _installed_skill_count(plugin_root: Optional[Path] = None) -> Optional[int]:
 def _mcp_server_names(plugin_root: Optional[Path] = None) -> list[str]:
     """The configured MCP server ids from .mcp.json that the health glyph ACTUALLY
     covers, with the `salesforce-` prefix stripped for display
-    (`salesforce-api-context` -> `api-context`). [] on any read error — the names
+    (`salesforce-metadata-experts` -> `metadata-experts`). [] on any read error — the names
     line is then omitted rather than invented.
 
-    Scoped to the platform-MCP servers in `_MCP_SERVER_SLUGS`: those are the
-    org-gated remote servers this feature probes. `salesforce-lsp` is a LOCAL
-    stdio process (not org-gated, not remotely reachable), so it is deliberately
-    excluded — otherwise it would sit next to a single ✓/✗ glyph that never
-    reflects it, which is exactly the mismatch a viewer misreads."""
+    Scoped to `_MCP_SERVER_SLUGS`: the single health glyph summarizes the
+    required remote servers. Optional H360 has its own informational readiness
+    row and must not appear beside a glyph that does not include it. The local
+    `salesforce-lsp` process is also excluded because the glyph does not reflect
+    its state."""
     try:
         servers = json.loads((_artifact_root(plugin_root) / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
     except _ARTIFACT_READ_ERRORS:
@@ -1826,7 +1886,9 @@ def _org_summary_segments(org: dict) -> list[tuple[str, str]]:
     ]
 
 
-def _environment_content(org: dict, mcp_status: str, plugin_root: Optional[Path] = None) -> list:
+def _environment_content(org: dict, mcp_status: str, plugin_root: Optional[Path] = None,
+                         *, h360_row: Optional[dict] = None,
+                         grounding_row: Optional[dict] = None) -> list:
     """The environment band's content (unframed): org summary, an optional dim
     detail line (username · instance), and the MCP line (real server names + a
     single tri-state indicator — never a fabricated per-server ✓)."""
@@ -1844,6 +1906,17 @@ def _environment_content(org: dict, mcp_status: str, plugin_root: Optional[Path]
                         (" — ", "muted"), (mcp_short, mcp_style)])
     else:
         content.append([("MCP: ", "muted"), (mcp_short, mcp_style)])
+    if "blocked by codex network policy" in mcp_status.lower():
+        for line in _wrap_cells(_MCP_POLICY_BLOCKED_MESSAGE, 78):
+            content.append([(line, "warn")])
+    active_org = (org.get("alias"), org.get("username"))
+    grounding = grounding_row if grounding_row is not None else _grounding_status_row(
+        active_org=active_org)
+    h360 = h360_row if h360_row is not None else _h360_status_row(active_org=active_org)
+    for label, row in (("Grounding: ", grounding), ("H360: ", h360)):
+        style = {"ok": "ok", "warn": "warn"}.get(row["status"], "muted")
+        for line in _wrap_cells(label + row["message"], 78):
+            content.append([(line, style)])
     return content
 
 
@@ -2066,7 +2139,8 @@ def render_banner_message(org: dict, project: dict, stats: dict, git_line: str, 
                           *, color: Optional[bool] = None, state: Optional[dict] = None,
                           notice_lines: Optional[list] = None,
                           show_logo: bool = True, show_invitation: bool = True,
-                          candidate: Optional[object] = None) -> str:
+                          candidate: Optional[object] = None, h360_row: Optional[dict] = None,
+                          grounding_row: Optional[dict] = None) -> str:
     """The connected/probed SessionStart surface (also `/status` and `/welcome`):
     the unified banner with the full environment band as slot 3 and the full project
     inventory as slot 4. A thin adapter over `render_session_banner` — it resolves
@@ -2098,7 +2172,8 @@ def render_banner_message(org: dict, project: dict, stats: dict, git_line: str, 
     return render_session_banner(
         color=resolved,
         facts=_banner_provenance(),
-        org_group=_environment_content(org, mcp_status),
+        org_group=_environment_content(org, mcp_status, h360_row=h360_row,
+                                       grounding_row=grounding_row),
         project_group=_project_content(project, stats, git_line),
         state=state,
         notice_lines=notice_lines,
@@ -2148,14 +2223,17 @@ def render_degraded_banner(org_group: list, project: Optional[dict] = None,
     )
 
 
-def _status_org_group(state: dict, org: Optional[dict], mcp_status: str) -> list:
+def _status_org_group(state: dict, org: Optional[dict], mcp_status: str,
+                      *, h360_row: Optional[dict] = None,
+                      grounding_row: Optional[dict] = None) -> list:
     """The org band's content for the status surface: the full probed environment
     block when the org resolved, else ONE honest degraded line keyed on why it did
     not (unreachable / not configured / CLI-or-query unknown). Extracted so the
     `/salesforce-development:org` command paint degrades through the identical lines
     as the full status surface — the two can never drift."""
     if org:
-        return _environment_content(org, mcp_status)
+        return _environment_content(org, mcp_status, h360_row=h360_row,
+                                    grounding_row=grounding_row)
     ctx = state.get("context") or {}
     status = ctx.get("orgStatus")
     if status == "unreachable":
@@ -2169,7 +2247,8 @@ def _status_org_group(state: dict, org: Optional[dict], mcp_status: str) -> list
 
 def render_status_surface(state: dict, org: Optional[dict], project: dict, stats: dict,
                           git_line: str, mcp_status: str, *, color: bool, logo: bool = False,
-                          candidate: Optional[object] = None) -> str:
+                          candidate: Optional[object] = None, h360_row: Optional[dict] = None,
+                          grounding_row: Optional[dict] = None) -> str:
     """The on-demand status view painted when the user asks for status by name: the
     connected-org and project bands PLUS the position nudge — the full "where I am"
     picture. Distinct from a positional question ("what's next"), which paints only
@@ -2187,7 +2266,8 @@ def render_status_surface(state: dict, org: Optional[dict], project: dict, stats
     return render_session_banner(
         color=color,
         facts=_banner_provenance(),
-        org_group=_status_org_group(state, org, mcp_status),
+        org_group=_status_org_group(state, org, mcp_status, h360_row=h360_row,
+                                    grounding_row=grounding_row),
         project_group=_project_content(project, stats, git_line),
         state=state,
         show_logo=logo,
@@ -4499,7 +4579,7 @@ def cmd_detect() -> int:
         if not Path("sfdx-project.json").exists():
             print(json.dumps({"continue": True}))
             return 0
-        emit("SessionStart", SKILLS_FIRST_REINJECT)
+        emit("SessionStart", _skills_first_reinject())
         return 0
 
     if not Path("sfdx-project.json").exists():
@@ -4765,7 +4845,7 @@ def cmd_cli_update_notice() -> int:
 
 
 def cmd_status(argv: Optional[list] = None) -> int:
-    """Print the same banner/org/project view as `detect`, but without writing env vars or fetching the JWT.
+    """Print the banner/org/project view with on-demand MCP endpoint probes.
     Suitable for on-demand /salesforce-development:status invocations.
 
     `--lean` (passed by the `/status` command) drops the session-start chrome — the
@@ -4811,7 +4891,8 @@ def cmd_status(argv: Optional[list] = None) -> int:
     # reachability, not a possibly-stale sidecar (the demo gap: a server activated
     # with no intervening MCP traffic would otherwise still read inactive). Falls
     # back to the last-known sidecar for any server whose probe cannot run.
-    mcp_status = _live_mcp_summary((target, org.get("alias"), org.get("username")))
+    mcp_status, h360_row, grounding_row = _live_mcp_readiness(
+        (target, org.get("alias"), org.get("username")))
     project = project_meta()
     stats = project_stats()
     git_line = git_status_line()
@@ -4837,7 +4918,8 @@ def cmd_status(argv: Optional[list] = None) -> int:
     # systemMessage surfaces, never on this reproduced pipe (mirrors cmd_journey).
     banner = render_banner_message(org, project, stats, git_line, mcp_status, color=False, state=state,
                                    show_logo=not lean, show_invitation=not lean,
-                                   candidate=candidate)
+                                   candidate=candidate, h360_row=h360_row,
+                                   grounding_row=grounding_row)
     print(_ANSI_RE.sub("", banner))
     return 0
 
@@ -5528,13 +5610,82 @@ def _check_source_tracking() -> dict:
 # `--probe` CLI arg both use the SLUG ARG (e.g. "metadata-experts"), never the `.mcp.json`
 # server key ("salesforce-metadata-experts").
 _MCP_SERVER_SLUGS = {
-    "salesforce-api-context": "salesforce-api-context",
     "salesforce-metadata-experts": "metadata-experts",
 }
+
+
+# Client-only probe outcome, never a claim about native MCP startup or org access.
+_MCP_POLICY_BLOCKED_MESSAGE = (
+    "Status check blocked by Codex network policy; endpoint health unverified. "
+    "Ask your Codex administrator to review access to the org's domain; local changes "
+    "may not override managed policy. Verify the MCP connection separately."
+)
+
+
+def _probe_json_prefix(text: str) -> dict:
+    """Read only complete top-level fields from a probe's truncated JSON object."""
+    decoder = json.JSONDecoder()
+    fields = {}
+    rest = text.strip()
+    if not rest.startswith("{"):
+        return {}
+    rest = rest[1:].lstrip()
+    while rest:
+        try:
+            key, end = decoder.raw_decode(rest)
+            if not isinstance(key, str) or key in fields:
+                return {}
+            rest = rest[end:].lstrip()
+            if not rest.startswith(":"):
+                return {}
+            value, end = decoder.raw_decode(rest[1:].lstrip())
+        except (ValueError, RecursionError):
+            return fields
+        fields[key] = value
+        rest = rest[1:].lstrip()[end:].lstrip()
+        if not rest.startswith(","):
+            return fields if not rest or rest == "}" else {}
+        rest = rest[1:].lstrip()
+    return fields
+
+
+def _codex_network_policy_evidence(*outputs) -> str:
+    """Recognize explicit proxy denials; return only a fixed, secret-free excerpt."""
+    if _plugin_client() != "codex":
+        return ""
+    for output in outputs:
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        if not isinstance(output, str):
+            continue
+        text = output[-16384:]
+        if re.search(r"x-proxy-error\s*:\s*blocked-by-allowlist\b", text, re.I):
+            return "x-proxy-error: blocked-by-allowlist"
+        if "domain is not on the allowlist for the current sandbox mode" in text.lower():
+            return "domain is not on the allowlist for the current sandbox mode"
+        # A plain 403 or an arbitrary 'allowlist' mention is not policy evidence.
+        for candidate in [text, *text.splitlines()]:
+            # The bundled --probe drops headers and prefixes at most 200 body
+            # characters with HTTP <status>. Decode that format as well as raw JSON.
+            wrapped = re.fullmatch(r"HTTP 403\s+(\{.*)", candidate.strip(), re.S)
+            payload = wrapped.group(1) if wrapped else candidate
+            truncated = bool(wrapped and len(payload) == 200)
+            try:
+                data = json.loads(payload)
+            except (ValueError, RecursionError):
+                data = _probe_json_prefix(payload) if truncated else None
+            if (isinstance(data, dict) and data.get("status") == "blocked"
+                    and data.get("decision") == "deny" and data.get("source") == "baseline_policy"
+                    and data.get("reason") == "not_allowed"
+                    and (data.get("message") == "Domain not in allowlist." or truncated)):
+                return "Codex proxy denial (not_allowed)" if truncated else "Domain not in allowlist."
+    return ""
+
 
 # state -> (row status, message). "inactive" is the headline case both WIN-033/WIN-040
 # exist for: the server is not activated/provisioned for this tenant.
 _MCP_STATE_TABLE = {
+    "policy-blocked": ("warn", _MCP_POLICY_BLOCKED_MESSAGE),
     "ok": ("ok", "Server active and reachable"),
     "inactive": ("critical",
                  "Server not activated in this org — enable it in Setup -> Integrations -> "
@@ -5573,8 +5724,8 @@ def _read_health_sidecar(slug: str) -> Optional[dict]:
 
 def _render_mcp_state_row(slug: str, state: Optional[str], detail: str = "") -> dict:
     """Render a check-tools row for `slug` from a health `state` string, per the
-    state -> row-status/message table in CONTRACT-mcp-health.md. An unknown/missing
-    state renders as a neutral warn row rather than crashing or guessing "ok"."""
+    state -> row-status/message table in CONTRACT-mcp-health.md. Unknown/missing
+    required-server states warn."""
     mapping = _MCP_STATE_TABLE.get(state or "")
     if mapping is None:
         return {"name": _mcp_row_name(slug), "status": "warn", "version": None,
@@ -5582,6 +5733,12 @@ def _render_mcp_state_row(slug: str, state: Optional[str], detail: str = "") -> 
     status, message = mapping
     if detail and state == "inactive":
         message = f"{message} ({detail})"
+    if state == "policy-blocked":
+        # Only recognized excerpts may be echoed, never arbitrary probe output.
+        if detail in ("x-proxy-error: blocked-by-allowlist", "Domain not in allowlist.",
+                       "Codex proxy denial (not_allowed)",
+                       "domain is not on the allowlist for the current sandbox mode"):
+            message += " Evidence: " + detail
     return {"name": _mcp_row_name(slug), "status": status, "version": None, "message": message}
 
 
@@ -5605,12 +5762,16 @@ def _summarize_mcp_states(observed: dict) -> str:
     an outage."""
     # Order = severity (worst first) so the summary surfaces the worst state.
     severity = ["inactive", "unreachable", "auth", "env-not-ready", "ok"]
-    total = len(_MCP_SERVER_SLUGS)
+    required = set(_MCP_SERVER_SLUGS.values())
+    observed = {slug: state for slug, state in observed.items() if slug in required}
+    if "policy-blocked" in observed.values():
+        return "sf-mcp-proxy: " + _MCP_POLICY_BLOCKED_MESSAGE
+    total = len(required)
     if not observed:
-        return "sf-mcp-proxy: not yet observed — run check-tools to probe (api-context, metadata-experts)"
+        return f"sf-mcp-proxy: not yet observed — run check-tools to probe ({', '.join(sorted(required))})"
     worst = next((s for s in severity if s in observed.values()), None)
     if worst == "ok" and len(observed) == total:
-        return "sf-mcp-proxy: api-context, metadata-experts active"
+        return f"sf-mcp-proxy: {', '.join(sorted(required))} active"
     # PARTIAL: at least one tracked server is healthy AND at least one is in a bad
     # state (inactive/unreachable/auth). A half-working feature is neither a full
     # outage nor healthy, so it gets its own "partial" summary → ⚠ glyph. The word
@@ -5724,6 +5885,15 @@ def _live_mcp_summary(active_org=None) -> str:
     return _summarize_mcp_states(observed)
 
 
+def _live_mcp_readiness(active_org=None) -> tuple[str, dict, dict]:
+    """Overlap optional H360 and grounding readiness with required-server checks on explicit asks."""
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        required = pool.submit(_live_mcp_summary, active_org=active_org)
+        h360 = pool.submit(_h360_status_row, active_org=active_org, probe=bool(active_org))
+        grounding = pool.submit(_grounding_status_row, active_org=active_org, probe=bool(active_org))
+        return required.result(), h360.result(), grounding.result()
+
+
 def _probe_server_raw(slug: str, timeout: Optional[int] = None) -> Optional[dict]:
     """WIN-040: actively probe one MCP server via
     `node <sf-mcp-proxy.bundled.js> --probe <slug>`, through the same WIN-026
@@ -5732,22 +5902,31 @@ def _probe_server_raw(slug: str, timeout: Optional[int] = None) -> Optional[dict
 
     Returns the parsed `{slug,state,detail,httpStatus,org}` JSON line from
     stdout, or None when the probe could not be run at all (missing proxy
-    bundle, non-zero exit, timeout, or unparseable stdout) — the caller
-    decides how to degrade (e.g. fall back to the passive sidecar). Never
-    raises."""
+    bundle, non-zero exit, timeout, or unparseable stdout). An explicit Codex
+    policy denial instead returns a client-only policy-blocked observation so
+    callers never reuse cached success. No producer sidecar state is changed.
+    Never raises."""
     proxy = Path(__file__).resolve().parent / "sf-mcp-proxy.bundled.js"
     if not proxy.exists():
         return None
     res = run_result(["node", str(proxy), "--probe", slug], timeout=timeout)
+    stdout = (res.stdout or "").strip()
+    # Contract: --probe prints one JSON line. Live success is authoritative even
+    # if stderr includes an unrelated warning about another network request.
+    try:
+        data = parse_json(stdout.splitlines()[-1]) if stdout else None
+    except RecursionError:
+        data = None
+    if res.ok and isinstance(data, dict) and data.get("state") == "ok":
+        return data
+    evidence = _codex_network_policy_evidence(stdout, res.stderr,
+                                             data.get("detail") if isinstance(data, dict) else "")
+    if evidence:
+        # Do not discard the denial and fall back to a stale green sidecar. Keep
+        # only the recognized excerpt, never raw stderr, tokens or hostnames.
+        return {"slug": slug, "state": "policy-blocked", "detail": evidence}
     if not res.ok:
         return None
-    stdout = (res.stdout or "").strip()
-    if not stdout:
-        return None
-    # Contract: "--probe" prints exactly one JSON line to stdout. Take the last
-    # non-empty line defensively in case anything else leaked onto stdout.
-    line = stdout.splitlines()[-1]
-    data = parse_json(line)
     return data if isinstance(data, dict) and data else None
 
 
@@ -5761,6 +5940,147 @@ def _probe_server(slug: str, timeout: Optional[int] = None) -> dict:
         return {"name": _mcp_row_name(slug), "status": "warn", "version": None,
                 "message": "Could not probe this server — see /doctor or re-run /status"}
     return _render_mcp_state_row(slug, data.get("state"), str(data.get("detail") or ""))
+
+
+_H360_SERVER = "salesforce-headless-360"
+
+
+def _h360_local_optin() -> Optional[bool]:
+    """Claude Bash commands may not receive userConfig; absence means unknown."""
+    if _plugin_client() == "codex":
+        return _headless_360_enabled()
+    if "CLAUDE_PLUGIN_OPTION_HEADLESS_360_ENABLED" in os.environ:
+        return _headless_360_enabled()
+    return None
+
+
+def _h360_setup_hint() -> str:
+    return ("ask to enable Headless 360 in Codex, then start a new session"
+            if _plugin_client() == "codex" else
+            "configure in /plugin and verify connection in /mcp")
+
+
+def _h360_status_row(*, active_org=None, probe: bool = False, detailed: bool = False) -> dict:
+    """Optional readiness: opt-in, endpoint evidence, and host tools are distinct.
+
+    Disabled/unknown opt-in never probes. Ambient renders only read matching-org
+    sidecars and label them last observed; explicit status/setup can probe outside
+    a hook deadline. Endpoint reachability never proves host tool exposure.
+    """
+    enabled = _h360_local_optin()
+    row = {"name": _mcp_row_name("headless-360"), "status": "info", "version": None,
+           "optional": True, "local_enabled": enabled}
+    if enabled is not True:
+        setting = "disabled locally" if enabled is False else "local opt-in unknown"
+        row["message"] = f"Optional; {setting}; enable locally for live Setup answers"
+        if detailed:
+            row["message"] = (f"Optional; {setting}; " + _h360_setup_hint()
+                              + ". Recommended for live Setup settings. Then in org Setup, search "
+                              "MCP Servers under API Catalog and toggle Headless360 on "
+                              "(allow up to 2 minutes).")
+        return row
+    if _plugin_client() == "codex":
+        module = _codex_h360_launcher()
+        if module is None or not module._headless_360_launcher_registered():
+            row["status"] = "warn"
+            row["message"] = ("Local opt-in enabled; launcher registration missing or stale; "
+                              "ask to enable Headless 360 again, then start a new session")
+            return row
+    data = _probe_server_raw("headless-360") if probe and _HOOK_DEADLINE is None and active_org else None
+    live = isinstance(data, dict) and bool(data.get("state"))
+    if not live:
+        data = _read_health_sidecar("headless-360")
+        identities = _org_identity_candidates(active_org)
+        if (not isinstance(data, dict) or not identities
+                or not isinstance(data.get("org"), str) or data["org"] not in identities):
+            data = None
+    state = data.get("state") if isinstance(data, dict) else None
+    row["health_state"] = state
+    if state == "policy-blocked":
+        row.update(_render_mcp_state_row("headless-360", state, str(data.get("detail") or "")))
+        row["message"] = "Local opt-in enabled; " + row["message"]
+        return row
+    prefix = "Local opt-in enabled; " if live else "Local opt-in enabled; Last observed "
+    messages = {
+        "ok": "endpoint reachable; verify host tools separately",
+        "inactive": ("server not activated in this org. In Setup, search MCP Servers, select it under "
+                     "API Catalog, and toggle Headless360 on. Allow up to 2 minutes, then rerun status"),
+        "auth": "authentication failed; verify the Salesforce CLI login and rerun status",
+        "unreachable": "endpoint unreachable; check network/VPN and rerun status",
+        "env-not-ready": "project/org context missing; open the Salesforce project and connect its target org",
+    }
+    if isinstance(state, str) and state in messages:
+        row["message"] = prefix + messages[state]
+        row["status"] = ("ok" if state == "ok" else "warn") if live else "info"
+    else:
+        row["message"] = "Local opt-in enabled; endpoint not verified; rerun status/setup and verify host tools"
+        if probe and _HOOK_DEADLINE is None:
+            row["status"] = "warn"
+    return row
+
+
+_GROUNDING_SLUG = "metadata-grounding"
+
+
+def _grounding_status_row(*, active_org=None, probe: bool = False) -> dict:
+    """Optional metadata grounding: reported beside, never inside, required health.
+
+    Not connected warns but never blocks — the server needs Salesforce Catalog, which
+    many orgs lack, and its skills fall back to name matching. Explicit status/setup
+    probe outside a hook deadline; ambient renders read only a matching-org sidecar,
+    labeled last observed. The proxy classifies a deactivated server's 404 as
+    unreachable, so that message names activation as well as the network.
+    """
+    row = {"name": _mcp_row_name(_GROUNDING_SLUG), "status": "info", "version": None,
+           "optional": True}
+    data = _probe_server_raw(_GROUNDING_SLUG) if probe and _HOOK_DEADLINE is None else None
+    live = isinstance(data, dict) and bool(data.get("state"))
+    if not live:
+        data = _read_health_sidecar(_GROUNDING_SLUG)
+        identities = _org_identity_candidates(active_org)
+        if (not isinstance(data, dict) or not identities
+                or not isinstance(data.get("org"), str) or data["org"] not in identities):
+            data = None
+    state = data.get("state") if isinstance(data, dict) else None
+    row["health_state"] = state
+    if state == "policy-blocked":
+        row.update(_render_mcp_state_row(_GROUNDING_SLUG, state, str(data.get("detail") or "")))
+        row["message"] = "Optional; " + row["message"]
+        return row
+    not_connected = ("not connected. Needs Salesforce Catalog; in Setup, search MCP Servers and "
+                     "activate metadata-grounding, or check network/VPN")
+    messages = {
+        "ok": "endpoint reachable",
+        "inactive": not_connected,
+        "unreachable": not_connected,
+        "auth": "authentication failed; verify the Salesforce CLI login and rerun status",
+        "env-not-ready": "project/org context missing; open the Salesforce project and connect its target org",
+    }
+    if isinstance(state, str) and state in messages:
+        row["message"] = ("Optional; " if live else "Optional; Last observed ") + messages[state]
+        row["status"] = "warn" if state != "ok" else ("ok" if live else "info")
+    elif probe and _HOOK_DEADLINE is None:
+        row["message"] = "Optional; connection not verified; rerun status or setup"
+        row["status"] = "warn"
+    else:
+        row["message"] = "Optional; not yet checked; rerun status or setup"
+    return row
+
+
+def _mcp_artifact_rows(proxy: Path, launcher: Path, servers: list) -> list:
+    """Report required proxy availability separately from optional H360 setup."""
+    if not proxy.exists():
+        config = {"name": "Salesforce MCP (config)", "status": "critical", "version": None,
+                  "message": f"MCP proxy bundle missing at {proxy.parent}. Try /reload-plugins."}
+    else:
+        config = {"name": "Salesforce MCP (config)", "status": "ok", "version": None,
+                  "message": f"Configured ({', '.join(s for s in servers if s != _H360_SERVER)})"}
+    if not launcher.exists():
+        optional = {"name": _mcp_row_name("headless-360"), "status": "warn", "version": None,
+                    "optional": True, "message": f"Optional Headless 360 launcher missing at {launcher}; reload the plugin to restore it"}
+    else:
+        optional = _h360_status_row(detailed=True)
+    return [config, optional]
 
 
 def _check_mcp() -> list:
@@ -5803,27 +6123,29 @@ def _check_mcp() -> list:
             # module under scripts/, not under a bin/ subdir, so resolve it as a
             # sibling of __file__ (mirrors _bundled_helper_path for sf-org-info).
             proxy = Path(__file__).resolve().parent / "sf-mcp-proxy.bundled.js"
-            if not proxy.exists():
-                rows.append({"name": "Salesforce MCP (config)", "status": "critical", "version": None,
-                             "message": f"MCP proxy bundle missing at {proxy}. Try /reload-plugins."})
-            else:
-                rows.append({"name": "Salesforce MCP (config)", "status": "ok", "version": None,
-                             "message": f"Configured ({', '.join(servers)})"})
+            launcher = Path(__file__).resolve().parent / "sf-headless-360-optin.js"
+            rows.extend(_mcp_artifact_rows(proxy, launcher, servers))
 
-    # (b) Per-server platform-MCP health (WIN-033 + WIN-040 — see
-    # CONTRACT-mcp-health.md). Replaces the old single "endpoint reachability"
-    # row (an org-instance-URL HEAD probe, `_probe_url`, which only proved
-    # network connectivity, never the platform-MCP host itself). check-tools is
-    # an on-demand invocation, so the row SHOWN here is the live `--probe`
-    # result (WIN-040) for each of the 2 servers; the proxy's own sidecar write
-    # keeps a later passive read (`_passive_mcp_row`, WIN-033) consistent. The
-    # two probes are independent subprocess calls, so run them concurrently
-    # (same nested-pool pattern as the org-list/org-display fetch above) rather
-    # than paying their timeouts back-to-back.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        probe_futs = [pool.submit(_probe_server, slug) for slug in _MCP_SERVER_SLUGS.values()]
+    # Required servers keep their existing health semantics. Grounding is optional and
+    # always probed live; H360 is optional and its helper probes only with a known
+    # enabled local preference.
+    required_slugs = list(_MCP_SERVER_SLUGS.values())
+    optional = next((row for row in rows if row.get("optional")), None)
+    rows = [row for row in rows if not row.get("optional")]
+    with ThreadPoolExecutor(max_workers=len(required_slugs) + 2) as pool:
+        probe_futs = [pool.submit(_probe_server, slug) for slug in required_slugs]
+        grounding_future = pool.submit(_grounding_status_row, probe=True)
+        # Resolve the target only for an enabled, registered optional server.
+        h360_future = (pool.submit(_h360_status_row, active_org=get_target_org(),
+                                   probe=True, detailed=True)
+                       if optional is not None and optional.get("local_enabled") is True
+                       and optional["status"] != "warn" else None)
         rows.extend(f.result() for f in probe_futs)
-
+        rows.append(grounding_future.result())
+        if h360_future is not None:
+            optional = h360_future.result()
+    if optional is not None:
+        rows.append(optional)
     # (c) Actual MCP process health — NOT knowable from this script (Claude Code
     # owns the MCP subprocess lifecycle). Report it as INFORMATIONAL (not a
     # warning) so a healthy setup can read fully green, while still refusing to
@@ -6017,8 +6339,10 @@ def _readiness_footer_line(rows: list) -> str:
 def _readiness_next_line(rows: list) -> str:
     """The readiness banner's dynamic "Next:" step, chosen from the scan: a tool needing
     install/update wins ("fix all"); else only the org-dependent rows need attention
-    ("connect an org"); else all green ("start building")."""
-    attention = [r for r in rows if r.get("status") in ("critical", "warn")]
+    ("connect an org"); else all green ("start building"). Optional rows still count
+    in the footer but never steer this step — they do not stop a build."""
+    attention = [r for r in rows
+                 if r.get("status") in ("critical", "warn") and not r.get("optional")]
     tool_attention = [r for r in attention if r.get("name") not in _READINESS_ORG_ROWS]
     if not attention:
         return 'Next: start building → "create a Salesforce project"'
@@ -6047,7 +6371,7 @@ def render_readiness_text(report: dict, *, color: bool = False) -> str:
 
     Input is the check-tools report ({"tools": [...], "diagnostic": {...}?}). Rows
     render in the report's fixed order (Salesforce CLI, Code Analyzer, Node.js, NPM,
-    Git, the three Salesforce MCP rows, Source Tracking); a row is omitted only if
+    Git, the Salesforce MCP rows, Source Tracking); a row is omitted only if
     the report omits it. Never raises on a well-formed report — and the paint hook
     wraps it fail-open regardless. The diagnostic block is intentionally NOT drawn
     here: it stays model-facing (the model surfaces it in prose), keeping the paint
@@ -6329,17 +6653,17 @@ def cmd_post_deploy_failure() -> int:
             "Deploy", "failed", source="cmd_post_deploy_failure", org_id=org_id,
             event_type="deploy")
 
-    # Branch on the deploy sub-command. `validate` and `quick` are prod-path
-    # operations with their own owning skills; bare `deploy start` is the general
-    # case. (`sf project deploy start` is the common form; the others are rarer.)
+    # All deploy sub-commands are owned by platform-metadata-deploy, including
+    # the prod-path `validate` (pre-deploy validation → 10-day job ID) and
+    # `quick` (promote a validated job → prod) operations folded into it. Lead
+    # with a sub-command-specific line so the advisory still names what failed.
     if "deploy validate" in cmd:
-        owner = ("platform-deploy-validate",
-                 "A pre-deploy VALIDATION failed — it caught the problem before it reached the org.")
+        lead = "A pre-deploy VALIDATION failed — it caught the problem before it reached the org."
     elif "deploy quick" in cmd:
-        owner = ("platform-quick-deploy",
-                 "A quick-deploy (validated job → prod) failed.")
+        lead = "A quick-deploy (validated job → prod) failed."
     else:
-        owner = ("platform-metadata-deploy", "A deploy failed.")
+        lead = "A deploy failed."
+    owner = ("platform-metadata-deploy", lead)
 
     skill, lead = owner
     advice = (
@@ -9941,7 +10265,7 @@ _DRIVE_RESUME = re.compile(
 # from explicit discovery / reactive tool-gate surfaces, where the caller's
 # invocation is already task evidence.
 _PLUGIN_ACTION_VERB = (
-    r"(?:add|analy[sz]e|apply|assign|author|build|configure|connect|coordinate"
+    r"(?:add|analy[sz]e|apply|assign|author|build|clone|configure|connect|coordinate"
     r"|convert|create|debug|delete|deploy|edit|enable|export|extend|find|fix"
     r"|generate|get|import|inspect|install|integrate|list|locate|make|manage"
     r"|migrate|open|optimi[sz]e|prepare|query|refactor|remove|rename|replace"
@@ -10070,14 +10394,107 @@ def _plugin_install_command(name: str) -> str:
     return f"{_PLUGIN_INSTALL_COMMAND_PREFIX} {name}"
 
 
+# Host inference (W-24599110). Hooks and command adapters set SF_AGENT_CLIENT, but a
+# shell command the model runs inside Codex may not, so the host is also inferred from
+# each agent's own markers. Strong markers name the process that spawned this script:
+# Codex's per-thread/session ids or a plugin copy under Codex's plugin cache, and
+# Claude Code's own session variables or a plugin copy under Claude's plugin dir.
+# CODEX_HOME alone is weak (a user may export it in every shell), so it decides only
+# when no Claude marker is present. Both strong sets at once is a conflict: "unknown".
+_CODEX_STRONG_ENV_MARKERS = ("CODEX_THREAD_ID", "CODEX_SESSION_ID")
+_CLAUDE_ENV_MARKERS = ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION")
+
+
+def _codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    return Path(raw) if raw else Path.home() / ".codex"
+
+
+def _plugin_root_under(base: Path) -> bool:
+    try:
+        root = _plugin_root()
+        # Keep environment detection live, while avoiding repeated filesystem walks.
+        # Relative config overrides must also be keyed by the working directory.
+        cwd = os.getcwd() if not base.is_absolute() or not Path(root).is_absolute() else ""
+        return _plugin_root_under_cached(root, base, cwd)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+@lru_cache(maxsize=32)
+def _plugin_root_under_cached(root: str, base: Path, cwd: str) -> bool:
+    try:
+        Path(root).resolve().relative_to(base.resolve())
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _inferred_plugin_host() -> str:
+    """Host named by agent markers alone: "claude", "codex", or "unknown" (conflict).
+
+    No marker at all keeps the legacy "claude" default.
+    """
+    env = os.environ
+    codex = (any(env.get(name, "").strip() for name in _CODEX_STRONG_ENV_MARKERS)
+             or _plugin_root_under(_codex_home() / "plugins" / "cache"))
+    claude = (any(env.get(name, "").strip() for name in _CLAUDE_ENV_MARKERS)
+              or _plugin_root_under(_claude_config_dir() / "plugins"))
+    if codex and claude:
+        return "unknown"
+    if codex:
+        return "codex"
+    if claude:
+        return "claude"
+    return "codex" if env.get("CODEX_HOME", "").strip() else "claude"
+
+
 def _plugin_client(requested: object = None) -> str:
-    """Return the active host without changing the legacy Claude default."""
+    """Return the active host for presentation and host commands.
+
+    An explicit request or SF_AGENT_CLIENT wins; otherwise the host is inferred from
+    agent markers: "claude", "codex", or "unknown" when the markers conflict. No
+    marker at all is still "claude" (legacy default). Display callers compare
+    against "codex", so an unknown host renders Claude-style text, but host-command
+    execution (`plugin-install`) refuses under "unknown" and prints the manual
+    install commands for both hosts instead.
+    """
     if isinstance(requested, str) and requested in _PLUGIN_CLIENTS:
         return requested
     explicit = os.environ.get("SF_AGENT_CLIENT", "").strip().lower()
     if explicit in _PLUGIN_CLIENTS:
         return explicit
-    return "claude"
+    return _inferred_plugin_host()
+
+
+def _plugin_selectors_disagree(requested: object = None) -> bool:
+    explicit = os.environ.get("SF_AGENT_CLIENT", "").strip().lower()
+    return (isinstance(requested, str) and requested in _PLUGIN_CLIENTS
+            and explicit in _PLUGIN_CLIENTS and requested != explicit)
+
+
+def _plugin_state_host(requested: object = None) -> str:
+    """Which agent's own config holds install state: "claude", "codex", or "unknown".
+
+    Install state (installed/enabled plugins, install-time userConfig defaults) is per
+    agent, so Claude's settings are read only when Claude is the host beyond doubt.
+    Conflicting explicit selectors return "unknown". Otherwise "codex"
+    (requested, SF_AGENT_CLIENT, or inferred) reads Codex's own config.
+    "claude" from a caller or SF_AGENT_CLIENT is honored only when no Codex marker
+    contradicts it; a contradiction, or a conflict between markers, is "unknown", and
+    callers treat unknown install state as uninstalled (keep recommending).
+    """
+    if _plugin_selectors_disagree(requested):
+        return "unknown"
+    explicit = os.environ.get("SF_AGENT_CLIENT", "").strip().lower()
+    for claim in (requested, explicit):
+        if claim == "codex":
+            return "codex"
+    inferred = _inferred_plugin_host()
+    claimed = any(claim == "claude" for claim in (requested, explicit))
+    if claimed and inferred != "claude":
+        return "unknown"
+    return inferred
 
 
 def _activate_host_working_directory(payload: dict, client: object = None) -> None:
@@ -10163,55 +10580,245 @@ def _plugin_proposal_match_reason(proposal: object) -> dict:
     }
 
 
-# --- Plugin-match sensitivity: persisted per-user override -------------------
-# Machine-wide (not per-project, not per-session), same rationale as
-# telemetry's own consent file: a "stop pestering me" / "tune the threshold"
-# preference is a sticky-across-projects choice. Lives under its own
-# subdirectory of ~/.sf (never ~/.sf itself) so `_ensure_private_runtime_dir`
-# only ever tightens permissions on a directory this plugin exclusively owns.
+# --- Plugin-match sensitivity: persisted user preference ---------------------
+# State ownership (W-24599110): install state is per agent and read from that
+# agent's own config, but this preference belongs to the user, so it is shared by
+# every agent (Claude Code, Codex, ...) and lives under ~/.sf, never in a .claude/
+# or .codex/ directory. One file holds an all-projects value plus optional
+# per-project values keyed by the stable project root, so one change applies to
+# every agent working in that project. The file shape stays backward-compatible:
+# a pre-existing `{"sensitivity": ...}` file is the all-projects value unchanged.
+# Lives under its own subdirectory of ~/.sf (never ~/.sf itself) so
+# `_ensure_private_runtime_dir` only ever tightens permissions on a directory
+# this plugin exclusively owns.
 _PLUGIN_MATCH_CONFIG_DIR = Path.home() / ".sf" / "plugin-recommendations"
-_PLUGIN_MATCH_CONFIG_MAX_BYTES = 512
+_PLUGIN_MATCH_CONFIG_MAX_BYTES = 64 * 1024
+_PLUGIN_MATCH_CONFIG_LOCK_WAIT_SECONDS = 1.0
+_PLUGIN_MATCH_CONFIG_UNREAD = object()
+
+
+class PluginMatchConfigCapacityError(OSError):
+    """The updated preference document would exceed the bounded store."""
 
 
 def _plugin_match_config_file() -> Path:
     return _PLUGIN_MATCH_CONFIG_DIR / "config.json"
 
 
-def _load_plugin_match_override() -> object:
-    """Return the persisted sensitivity override (a level string or float), or
-    None if unset/corrupt/invalid -- fail-open, same discipline as
-    `_load_plugin_proposals`."""
+def _read_plugin_match_config(*, for_update: bool = False) -> Optional[dict]:
+    """The persisted preference document, or None if unset/corrupt -- fail-open,
+    same discipline as `_load_plugin_proposals`. For updates, absence is an empty
+    document and every other read/parse failure raises OSError to preserve it."""
     text = _private_text(
         _plugin_match_config_file(), max_bytes=_PLUGIN_MATCH_CONFIG_MAX_BYTES,
     )
     if text is None:
+        if for_update:
+            # Only absence permits starting a new document. A rejected file or
+            # failed read must never become an empty replacement (or an unlink).
+            try:
+                _plugin_match_config_file().lstat()
+            except FileNotFoundError:
+                return {}
+            raise OSError("Plugin recommendation preferences could not be read")
         return None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
+        if for_update:
+            raise OSError("Plugin recommendation preferences contain invalid JSON")
         return None
-    if not isinstance(data, dict):
+    if for_update and not isinstance(data, dict):
+        raise OSError("Plugin recommendation preferences must be an object")
+    return data if isinstance(data, dict) else None
+
+
+def _write_plugin_match_config(data: dict) -> bool:
+    """Persist the document atomically; an empty document removes the file."""
+    if not data:
+        try:
+            _plugin_match_config_file().unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+    if not _ensure_private_runtime_dir(_PLUGIN_MATCH_CONFIG_DIR):
+        return False
+    try:
+        encoded = json.dumps(data, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False
+    if len(encoded.encode("utf-8")) > _PLUGIN_MATCH_CONFIG_MAX_BYTES:
+        raise PluginMatchConfigCapacityError("Plugin recommendation preference store is full")
+    return _atomic_private_text(_plugin_match_config_file(), encoded)
+
+
+def _plugin_match_project_key(project_root: Optional[Path] = None) -> str:
+    """The project a per-project preference applies to: the stable project root
+    (nearest `sfdx-project.json` ancestor, else the working directory)."""
+    return os.fspath(_stable_project_root(project_root))
+
+
+def _plugin_match_projects(data: Optional[dict]) -> dict:
+    projects = data.get("projects") if isinstance(data, dict) else None
+    return projects if isinstance(projects, dict) else {}
+
+
+def _load_plugin_match_override(config: object = _PLUGIN_MATCH_CONFIG_UNREAD) -> object:
+    """Return the persisted all-projects override (a level string or float), or
+    None if unset/corrupt/invalid."""
+    data = _read_plugin_match_config() if config is _PLUGIN_MATCH_CONFIG_UNREAD else config
+    if data is None:
         return None
     return _parse_plugin_match_sensitivity(data.get("sensitivity"))
 
 
-def _save_plugin_match_override(sensitivity: object) -> bool:
+def _load_plugin_match_project_override(
+    project_root: Optional[Path] = None, *, config: object = _PLUGIN_MATCH_CONFIG_UNREAD,
+) -> object:
+    """Return this project's persisted override, or None if unset/corrupt/invalid."""
+    data = _read_plugin_match_config() if config is _PLUGIN_MATCH_CONFIG_UNREAD else config
+    entry = _plugin_match_projects(data).get(
+        _plugin_match_project_key(project_root))
+    if not isinstance(entry, dict):
+        return None
+    return _parse_plugin_match_sensitivity(entry.get("sensitivity"))
+
+
+def _acquire_plugin_match_config_lock() -> Optional[int]:
+    """Hold a persistent, private OS lock across the whole preference update.
+
+    Reuse the phase writer's cross-platform advisory primitive. Never unlink the
+    lock file: replacing it would let two writers lock different inodes.
+    """
     if not _ensure_private_runtime_dir(_PLUGIN_MATCH_CONFIG_DIR):
-        return False
-    encoded = json.dumps({"sensitivity": sensitivity}, separators=(",", ":"))
-    return _atomic_private_text(_plugin_match_config_file(), encoded)
+        return None
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    try:
+        fd = os.open(_PLUGIN_MATCH_CONFIG_DIR / "config.lock", flags, 0o600)
+        if not _phase_private_fd(fd):
+            os.close(fd)
+            return None
+        deadline = time.monotonic() + _PLUGIN_MATCH_CONFIG_LOCK_WAIT_SECONDS
+        while not _try_phase_advisory_lock(fd):
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.01)
+        return fd
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        return None
+
+
+def _update_plugin_match_config(
+    sensitivity: object = None, *, project: bool = False,
+    project_root: Optional[Path] = None, clear: bool = False, prune: bool = False,
+) -> str:
+    """Serialize read/modify/write; return saved, removed, unset, or error."""
+    lock = _acquire_plugin_match_config_lock()
+    if lock is None:
+        return "error"
+    try:
+        data = _read_plugin_match_config(for_update=True)
+        if prune:
+            projects = dict(_plugin_match_projects(data))
+            removed = False
+            for root in list(projects):
+                if not isinstance(root, str) or not Path(root).is_absolute():
+                    continue
+                try:
+                    Path(root).stat()
+                except FileNotFoundError:
+                    projects.pop(root)
+                    removed = True
+                except (OSError, ValueError):
+                    pass  # Inaccessible or temporarily unavailable is not proven absent.
+            if not removed:
+                return "unset"
+            if projects:
+                data["projects"] = projects
+            else:
+                data.pop("projects", None)
+        elif project:
+            projects = dict(_plugin_match_projects(data))
+            key = _plugin_match_project_key(project_root)
+            if clear:
+                if key not in projects:
+                    return "unset"
+                projects.pop(key)
+            else:
+                projects[key] = {"sensitivity": sensitivity}
+            if projects:
+                data["projects"] = projects
+            else:
+                data.pop("projects", None)
+        elif clear:
+            data.pop("sensitivity", None)
+        else:
+            data["sensitivity"] = sensitivity
+        if not _write_plugin_match_config(data):
+            return "error"
+        return "removed" if clear or prune else "saved"
+    except PluginMatchConfigCapacityError:
+        raise
+    except OSError:
+        return "error"
+    finally:
+        _release_phase_history_lock(lock)
+
+
+def _save_plugin_match_override(sensitivity: object) -> bool:
+    """Save the all-projects value, keeping every per-project value."""
+    return _update_plugin_match_config(sensitivity) == "saved"
+
+
+def _save_plugin_match_project_override(
+    sensitivity: object, project_root: Optional[Path] = None,
+) -> bool:
+    """Save this project's value, keeping the all-projects value and other projects."""
+    return _update_plugin_match_config(
+        sensitivity, project=True, project_root=project_root) == "saved"
 
 
 def _clear_plugin_match_override() -> bool:
-    """Delete the persisted override so the effective value reverts to the
-    plugin/install default -- undo the override, don't force 'standard'."""
-    try:
-        _plugin_match_config_file().unlink()
-        return True
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
+    """Remove the all-projects value so the effective value reverts to the
+    plugin/install default -- undo the override, don't force 'standard'.
+    Per-project values are kept."""
+    return _update_plugin_match_config(clear=True) == "removed"
+
+
+def _clear_plugin_match_project_override(project_root: Optional[Path] = None) -> str:
+    """Remove this project's value so it follows the all-projects value again.
+
+    Returns "removed" when an entry was deleted, "unset" when this project had no
+    saved value (nothing to remove, nothing written), or "error" when the write failed.
+    """
+    return _update_plugin_match_config(project=True, project_root=project_root, clear=True)
+
+
+def _plugin_match_write_failure(what: str, fallback: str = "") -> str:
+    """Why a preference write failed, and what to do next.
+
+    Under Codex the usual cause is the workspace-write sandbox: the shared file
+    lives under ~/.sf, outside the workspace, so a retry without escalation fails
+    the same way. Name that and ask for escalation instead of "try again".
+    """
+    if _plugin_client() == "codex":
+        return (f"⚠️  Could not {what}. The Codex sandbox most likely blocked the "
+                f"write to {_plugin_match_config_file()} (outside the workspace). Run the same "
+                "command again with sandbox_permissions=\"require_escalated\" and a "
+                "justification such as \"Save a Salesforce plugin-recommendation "
+                "preference under ~/.sf\"." + (" " + fallback if fallback else ""))
+    return (f"⚠️  Could not {what} (the preference file is busy or unwritable). "
+            "Try again in a moment." + (" " + fallback if fallback else ""))
+
+
+_PLUGIN_MATCH_SOURCE_PROJECT = "your saved preference for this project"
+_PLUGIN_MATCH_SOURCE_USER = "your saved preference for all projects"
 
 
 def _plugin_match_sensitivity_with_source() -> tuple:
@@ -10223,9 +10830,11 @@ def _plugin_match_sensitivity_with_source() -> tuple:
     `except Exception: return []` posture:
       1. SF_DISABLE_PLUGIN_MATCH (hard off, mirrors SF_DISABLE_TELEMETRY)
       2. SF_PLUGIN_MATCH_SENSITIVITY env var
-      3. a persisted in-session preference (this file's `set`/`off`/`on`)
-      4. CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY (the userConfig default)
-      5. "standard"
+      3. this project's saved preference (`plugin-match-config --project ...`)
+      4. the all-projects saved preference (`plugin-match-config set`/`off`/`on`)
+      5. CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY (Claude's userConfig
+         default; install-time state of one agent, so never read under Codex)
+      6. "standard"
     Kept separate from the value-only `_plugin_match_sensitivity` so the hot
     path -- every hook invocation -- does no extra string-building work.
     """
@@ -10236,14 +10845,19 @@ def _plugin_match_sensitivity_with_source() -> tuple:
     )
     if env_value is not None:
         return env_value, "SF_PLUGIN_MATCH_SENSITIVITY"
-    saved = _load_plugin_match_override()
+    config = _read_plugin_match_config()
+    project_saved = _load_plugin_match_project_override(config=config)
+    if project_saved is not None:
+        return project_saved, _PLUGIN_MATCH_SOURCE_PROJECT
+    saved = _load_plugin_match_override(config)
     if saved is not None:
-        return saved, "your saved preference"
-    option_value = _parse_plugin_match_sensitivity(
-        os.environ.get("CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY")
-    )
-    if option_value is not None:
-        return option_value, "plugin default (userConfig)"
+        return saved, _PLUGIN_MATCH_SOURCE_USER
+    if _plugin_state_host() == "claude":
+        option_value = _parse_plugin_match_sensitivity(
+            os.environ.get("CLAUDE_PLUGIN_OPTION_PLUGIN_MATCH_SENSITIVITY")
+        )
+        if option_value is not None:
+            return option_value, "plugin default (userConfig)"
     return "standard", "built-in default"
 
 
@@ -11424,11 +12038,12 @@ def _enabled_plugin_names(
     appears here at all -- callers must separately exclude the plugin currently
     running this code.
     """
-    active_client = _plugin_client(client)
+    active_client = _plugin_state_host(client)
+    if active_client == "unknown":
+        # Never read Claude's settings when the host might be Codex (W-24599110).
+        return None
     if active_client == "codex":
-        config_path = codex_config or Path(
-            os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
-        ) / "config.toml"
+        config_path = codex_config or _codex_home() / "config.toml"
         if tomllib is not None:
             try:
                 data = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -11608,7 +12223,7 @@ def _plugin_catalog_match(
         enabled = (
             _enabled_plugin_names()
             if client is None
-            else _enabled_plugin_names(_plugin_client(client))
+            else _enabled_plugin_names(client)
         )
         candidate_plugins = [
             plugin for plugin in plugins
@@ -13005,10 +13620,12 @@ def _status_command_paint(root: Path) -> tuple[str, str]:
     # resolved before the render call so the SAME pick feeds both the visible nudge
     # slot below and the model-facing note, no re-probe.
     candidate = _select_inline_nudge(state, root, org)
+    mcp_status, h360_row, grounding_row = _live_mcp_readiness(active_org)
     surface = render_status_surface(
         state, org, project_meta(), project_stats(), git_status_line(),
-        _live_mcp_summary(active_org=active_org),
+        mcp_status,
         color=_banner_color_enabled(), logo=False, candidate=candidate,
+        h360_row=h360_row, grounding_row=grounding_row,
     )
     return _status_paint_note(state, candidate=candidate), surface
 
@@ -13026,10 +13643,12 @@ def _welcome_command_paint(root: Path) -> tuple[str, str]:
     # resolved before the render call so the SAME pick feeds both the visible nudge
     # slot below and the model-facing note, no re-probe.
     candidate = _select_inline_nudge(state, root, org)
+    mcp_status, h360_row, grounding_row = _live_mcp_readiness(active_org)
     surface = render_status_surface(
         state, org, project_meta(), project_stats(), git_status_line(),
-        _live_mcp_summary(active_org=active_org),
+        mcp_status,
         color=_banner_color_enabled(), logo=True, candidate=candidate,
+        h360_row=h360_row, grounding_row=grounding_row,
     )
     return _status_paint_note(state, candidate=candidate), surface
 
@@ -13040,10 +13659,11 @@ def _org_command_paint(root: Path) -> tuple[str, str]:
     (`_status_org_group`) when no org resolves. Project-independent: an org can be a
     global default. Skips the MCP probe when there is no org (the degraded line omits it)."""
     state, org = _resolve_position_and_org(root)
-    mcp = (_live_mcp_summary(active_org=(org.get("alias"), org.get("username")))
-           if org else "")
+    mcp, h360_row, grounding_row = (_live_mcp_readiness((org.get("alias"), org.get("username")))
+                                     if org else ("", None, None))
     surface = "\n".join(render_band(
-        _status_org_group(state, org, mcp), color=_banner_color_enabled()))
+        _status_org_group(state, org, mcp, h360_row=h360_row, grounding_row=grounding_row),
+        color=_banner_color_enabled()))
     return _org_paint_note(), surface
 
 
@@ -13520,10 +14140,12 @@ def cmd_orientation_paint(payload: Optional[dict] = None,
                     # real reachability rather than a stale sidecar (matches /status).
                     mcp_active_org = (org.get("alias"), org.get("username")) if org else None
                     message = _status_paint_note(state, candidate=candidate)
+                    mcp_status, h360_row, grounding_row = _live_mcp_readiness(mcp_active_org)
                     surface = render_status_surface(
                         state, org, project_meta(), project_stats(), git_status_line(),
-                        _live_mcp_summary(active_org=mcp_active_org),
+                        mcp_status,
                         color=color, logo=show_logo, candidate=candidate,
+                        h360_row=h360_row, grounding_row=grounding_row,
                     )
                 if not _prompt_nudge_allowed(prompt_context):
                     print(json.dumps({"continue": True}))
@@ -14240,17 +14862,74 @@ def cmd_plugin_match(args: list[str]) -> int:
     return 0
 
 
-def cmd_plugin_match_config(args: list[str]) -> int:
-    """`plugin-match-config <on|off|status|set <value>>` — human-readable,
-    in-session control over the uninstalled-plugin recommendation sensitivity
-    (see `_plugin_match_sensitivity_with_source`). Prints text (not hook
-    JSON) because the slash command echoes output to the user, mirroring
-    `cmd_consent`'s on/off/status shape in sf_telemetry.py, plus `set`.
+_PLUGIN_MATCH_CONFIG_USAGE = (
+    "Usage: sf-context plugin-match-config [--project] <on|off|status>",
+    "       sf-context plugin-match-config [--project] set <low|standard|high|1.0-10.0>",
+    "       sf-context plugin-match-config prune",
+)
 
-    Usage: sf-context plugin-match-config <on|off|status>
-           sf-context plugin-match-config set <low|standard|high|1.0-10.0>
+
+def _plugin_match_project_note() -> str:
+    """After an all-projects change, say so when this project keeps its own value."""
+    project_saved = _load_plugin_match_project_override()
+    if project_saved is None:
+        return ""
+    return ("\n" + _host_text(
+        f"   Note: this project has its own saved setting ({project_saved}), which still "
+        "applies here. Remove it with: " + _host_run_prefix()
+        + "/salesforce-development:plugin-recommendations on --project"))
+
+
+def cmd_plugin_match_config(args: list[str]) -> int:
+    """Run a preference command and report capacity separately from I/O failures."""
+    try:
+        return _cmd_plugin_match_config(args)
+    except PluginMatchConfigCapacityError:
+        print(_host_text(
+            f"⚠️  Plugin recommendation preferences exceed the 64 KiB limit at "
+            f"{_plugin_match_config_file()}. Nothing was changed. Run "
+            + _host_run_prefix() + "/salesforce-development:plugin-recommendations prune "
+            "to remove saved settings for project folders that no longer exist, or run "
+            + _host_run_prefix() + "/salesforce-development:plugin-recommendations on --project "
+            "from projects whose saved settings you no longer need. Then retry the save."),
+            file=sys.stderr)
+        return 1
+
+
+def _cmd_plugin_match_config(args: list[str]) -> int:
+    """`plugin-match-config [--project] <on|off|status|set <value>>` --
+    human-readable, in-session control over the uninstalled-plugin
+    recommendation sensitivity (see `_plugin_match_sensitivity_with_source`).
+    Prints text (not hook JSON) because the slash command echoes output to the
+    user, mirroring `cmd_consent`'s on/off/status shape in sf_telemetry.py,
+    plus `set`. `--project` scopes on/off/set to the current project root, so
+    the change applies to every agent working in that project; without it the
+    change applies to all projects. The saved preference is shared by every
+    agent (it lives under ~/.sf), so the same command works on each host.
+
+    Usage: sf-context plugin-match-config [--project] <on|off|status>
+           sf-context plugin-match-config [--project] set <low|standard|high|1.0-10.0>
+           sf-context plugin-match-config prune
     """
+    project = "--project" in args
+    args = [arg for arg in args if arg != "--project"]
     action = (args[0] if args else "status").lower()
+    project_root = _plugin_match_project_key() if project else ""
+
+    if action == "prune":
+        if project or len(args) != 1:
+            print("Usage: sf-context plugin-match-config prune", file=sys.stderr)
+            return 2
+        outcome = _update_plugin_match_config(prune=True)
+        if outcome == "error":
+            print(_plugin_match_write_failure("prune your saved preferences"), file=sys.stderr)
+            return 1
+        if outcome == "removed":
+            _fire_plugin_recommendation_configured("reset", "default")
+            print("✅ Removed saved settings for project folders that no longer exist.")
+        else:
+            print("ℹ️  No saved settings for missing project folders. Nothing was changed.")
+        return 0
 
     if action == "status":
         sensitivity, source = _plugin_match_sensitivity_with_source()
@@ -14263,34 +14942,62 @@ def cmd_plugin_match_config(args: list[str]) -> int:
         else:
             state = f"custom ({sensitivity}) (effective threshold: {sensitivity})"
         print("Plugin recommendation sensitivity")
-        print(f"  State:  {state}")
-        print(f"  Source: {source}")
+        print(f"  State:   {state}")
+        print(f"  Source:  {source}")
+        print(f"  Project: {_plugin_match_project_key()}")
         print(_host_text("Change it any time: " + _host_run_prefix()
                          + "/salesforce-development:plugin-recommendations "
-                         "off|on|status|set <low|standard|high|1.0-10.0>"))
+                         "off|on|status|set <low|standard|high|1.0-10.0> "
+                         "(add --project for this project only)"))
         return 0
 
     if action == "on":
-        if not _clear_plugin_match_override():
-            print("⚠️  Could not clear your saved preference (the preference file is "
-                  "busy or unwritable). Try again in a moment.", file=sys.stderr)
+        if project:
+            outcome = _clear_plugin_match_project_override()
+            cleared = outcome != "error"
+        else:
+            outcome = "removed"
+            cleared = _clear_plugin_match_override()
+        if not cleared:
+            print(_plugin_match_write_failure("clear your saved preference"),
+                  file=sys.stderr)
             return 1
+        if outcome == "unset":
+            print(f"ℹ️  This project has no saved setting ({project_root}); it already "
+                  "follows your all-projects setting or the plugin's default. Nothing "
+                  "was changed.\n"
+                  + _host_text("   Check it any time with: " + _host_run_prefix()
+                         + "/salesforce-development:plugin-recommendations status"))
+            return 0
         _fire_plugin_recommendation_configured("reset", "default")
+        if project:
+            print(f"✅ This project's saved setting was removed ({project_root}); it now "
+                  "follows your all-projects setting or the plugin's default.\n"
+                  + _host_text("   Check it any time with: " + _host_run_prefix()
+                         + "/salesforce-development:plugin-recommendations status"))
+            return 0
         print("✅ Plugin recommendations reset to the plugin's default sensitivity.\n"
               + _host_text("   Check it any time with: " + _host_run_prefix()
-                     + "/salesforce-development:plugin-recommendations status"))
+                     + "/salesforce-development:plugin-recommendations status")
+              + _plugin_match_project_note())
         return 0
 
     if action == "off":
-        if not _save_plugin_match_override("off"):
-            print("⚠️  Could not persist the setting (the preference file is busy or "
-                  "unwritable). Try again in a moment, or set SF_DISABLE_PLUGIN_MATCH=1 "
-                  "to stop it immediately.", file=sys.stderr)
+        saved = (_save_plugin_match_project_override("off") if project
+                 else _save_plugin_match_override("off"))
+        if not saved:
+            print(_plugin_match_write_failure(
+                "persist the setting",
+                "Or set SF_DISABLE_PLUGIN_MATCH=1 to stop it immediately."),
+                file=sys.stderr)
             return 1
         _fire_plugin_recommendation_configured("disable", "off")
-        print("🛑 Plugin recommendations are now OFF for this user.\n"
+        scope = f"for this project ({project_root})" if project else "for this user"
+        print(f"🛑 Plugin recommendations are now OFF {scope}.\n"
               + _host_text("   Turn them back on any time with: " + _host_run_prefix()
-                     + "/salesforce-development:plugin-recommendations on"))
+                     + "/salesforce-development:plugin-recommendations on"
+                     + (" --project" if project else ""))
+              + ("" if project else _plugin_match_project_note()))
         return 0
 
     if action == "set":
@@ -14302,9 +15009,10 @@ def cmd_plugin_match_config(args: list[str]) -> int:
                   f"{sorted(_PLUGIN_MATCH_NAMED_LEVELS)} or a number between "
                   f"{low} and {high}.", file=sys.stderr)
             return 1
-        if not _save_plugin_match_override(parsed):
-            print("⚠️  Could not persist the setting (the preference file is busy or "
-                  "unwritable). Try again in a moment.", file=sys.stderr)
+        saved = (_save_plugin_match_project_override(parsed) if project
+                 else _save_plugin_match_override(parsed))
+        if not saved:
+            print(_plugin_match_write_failure("persist the setting"), file=sys.stderr)
             return 1
         if parsed == "off":
             _fire_plugin_recommendation_configured("disable", "off")
@@ -14313,12 +15021,15 @@ def cmd_plugin_match_config(args: list[str]) -> int:
             _fire_plugin_recommendation_configured("set", level)
         threshold = _resolve_plugin_match_threshold(parsed)
         resolved = threshold if threshold is not None else "module default"
-        print(f"✅ Plugin-match sensitivity set to {parsed} (effective threshold: {resolved}).")
+        scope = f" for this project ({project_root})" if project else ""
+        print(f"✅ Plugin-match sensitivity set to {parsed}{scope} "
+              f"(effective threshold: {resolved})."
+              + ("" if project else _plugin_match_project_note()))
         return 0
 
     print(f"Unknown plugin-match-config action: {action}", file=sys.stderr)
-    print("Usage: sf-context plugin-match-config <on|off|status>", file=sys.stderr)
-    print("       sf-context plugin-match-config set <low|standard|high|1.0-10.0>", file=sys.stderr)
+    for line in _PLUGIN_MATCH_CONFIG_USAGE:
+        print(line, file=sys.stderr)
     return 2
 
 
@@ -14501,7 +15212,7 @@ def _plugin_install_lookup(name: str, client: object = None) -> PluginInstallLoo
         return PluginInstallLookupResult(None, "unknown")
     if entry.get("name") == _plugin_display_name():
         return PluginInstallLookupResult(None, "self")
-    enabled = _enabled_plugin_names(_plugin_client(client))
+    enabled = _enabled_plugin_names(client)
     if enabled is not None and name in enabled:
         return PluginInstallLookupResult(None, "already_installed")
     return PluginInstallLookupResult(entry, "ok")
@@ -14639,6 +15350,40 @@ def _render_plugin_install_dry_run(
             "depends on this plugin continues."
         )
     return "\n".join(lines)
+
+
+def _render_plugin_install_manual_commands(
+    name: str, entry: dict, cause: str = "Claude Code and Codex markers conflict",
+) -> str:
+    """Refusal text for an unclear host: the manual install commands for both hosts.
+
+    `cause` names why the host is unclear (conflicting markers, or `--client` and
+    SF_AGENT_CLIENT naming different agents) so the user sees the real conflict.
+
+    Nothing is executed. The user picks the agent they are actually running. The
+    text is addressed to the user through the model: it never suggests a host
+    override, because a model-chosen override would pick the install target itself.
+    It goes to stdout so the route note's "relay the command's stdout" handoff
+    relays it.
+    """
+    marketplace = _plugin_install_marketplace_name(name, entry)
+    target = f"{name}@{marketplace}"
+    return "\n".join([
+        f"Plugin install refused: the host agent is unclear ({cause}), so {name} "
+        "was not installed and no install command ran.",
+        "Install it manually in the agent you are using:",
+        "  Claude Code:",
+        f"    claude plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}",
+        f"    claude plugin install {target}",
+        "    then run /reload-plugins",
+        "  Codex:",
+        f"    codex plugin marketplace add {_SALESFORCE_MARKETPLACE_REPO}",
+        f"    codex plugin add {target}",
+        "    then start a new Codex session",
+        "Show these commands to the user; the user runs the one for the agent they "
+        "are using. Do not retry plugin-install, and do not set SF_AGENT_CLIENT or "
+        "--client to override the host.",
+    ])
 
 
 def _plugin_install_args(args: list[str]) -> Optional[dict]:
@@ -14999,6 +15744,34 @@ def cmd_plugin_install(args: list[str]) -> int:
         return 2
     entry = lookup.entry
 
+    # An unclear host must never reach a host command: running `claude ...` inside
+    # Codex (or the reverse) installs into the wrong agent and skips the Codex
+    # user-confirmation gate. `_plugin_state_host` also catches an explicit
+    # `--client claude` that a Codex marker contradicts. Refuse before any preview
+    # or nonce so nothing in this flow can execute; decline (above) stays allowed.
+    # The refusal goes to stdout: it is the handoff the route note says to relay.
+    # Two explicit selectors that disagree (`--client claude` under
+    # SF_AGENT_CLIENT=codex, or the reverse) are also unclear. Share the state
+    # resolver's conflict check rather than letting presentation select a host.
+    selectors_disagree = _plugin_selectors_disagree(parsed["client"])
+    if (selectors_disagree or client == "unknown"
+            or _plugin_state_host(parsed["client"]) == "unknown"):
+        if selectors_disagree:
+            cause = "--client and SF_AGENT_CLIENT name different agents"
+        elif _inferred_plugin_host() == "unknown":
+            cause = "Claude Code and Codex markers conflict"
+        else:
+            cause = "a Claude Code selection is contradicted by a Codex marker"
+        print(_render_plugin_install_manual_commands(name, entry, cause))
+        _fire_plugin_install_result("host_unclear", session_id, name)
+        return 2
+    # An explicit codex selector (`--client codex` or SF_AGENT_CLIENT=codex, which
+    # Codex hooks always set) still resolves a marker conflict, so a Codex session
+    # with leaked Claude markers keeps working. The selector is unverified, though,
+    # so under a conflict it never gets the trusted-source fast path: the install
+    # goes through the source preview and the user's own nonce confirmation.
+    markers_conflict = _inferred_plugin_host() == "unknown"
+
     nonce = _plugin_install_nonce(name, entry)
     if parsed["accept_proposed"]:
         if not _plugin_recommendation_supported(name, client):
@@ -15037,7 +15810,7 @@ def cmd_plugin_install(args: list[str]) -> int:
             )
             _fire_plugin_install_result("proposal_not_selected", session_id, name)
             return 2
-        if _plugin_install_is_trusted_source(name, entry):
+        if _plugin_install_is_trusted_source(name, entry) and not markers_conflict:
             if client == "codex":
                 return _perform_plugin_install(name, entry, session_id, client)
             return _perform_plugin_install(name, entry, session_id)

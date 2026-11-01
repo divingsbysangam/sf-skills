@@ -2,10 +2,33 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import unittest
 from pathlib import Path
+from unittest import mock
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+HOST_MARKER_KEYS = (
+    "SF_AGENT_CLIENT", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_HOME",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CONFIG_DIR",
+)
+
+
+def isolate_host_markers():
+    """Give a test module a neutral host; host-specific cases set their own markers.
+
+    Restore the caller's environment when unittest finishes the module, including
+    when setup fails. This also works when tests are run directly from either host.
+    """
+    patch = mock.patch.dict(os.environ, {
+        key: value for key, value in os.environ.items() if key not in HOST_MARKER_KEYS
+    }, clear=True)
+    # Some older tests use patch.stopall(); keep this module fixture outside
+    # that per-test registry so those cleanups cannot restore ambient markers.
+    patch.__enter__()
+    unittest.addModuleCleanup(patch.__exit__, None, None, None)
 
 
 def load_module(path: Path, name: str):

@@ -1,0 +1,9 @@
+[
+  "service-itsm-agentic-setup-agentforce-coordinate",
+  "service-itsm-agentic-setup-agentforce-studio-configure",
+  "service-itsm-agentic-setup-agentforce-studio-validate",
+  "service-itsm-agentic-setup-fulfiller-agent-configure",
+  "service-itsm-agentic-setup-employee-agent-configure",
+  "service-itsm-agentic-setup-itsm-agentforce-permset-assign",
+  "service-itsm-agentic-setup-agent-runtime-access-assign"
+]

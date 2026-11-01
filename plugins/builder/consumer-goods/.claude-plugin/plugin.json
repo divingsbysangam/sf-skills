@@ -1,0 +1,28 @@
+{
+  "name": "consumer-goods",
+  "displayName": "Salesforce Consumer Goods Cloud",
+  "version": "0.1.0",
+  "description": "Set up Consumer Goods Cloud TPM liability accruals and its summary Lightning component, Trade Promotion Effectiveness (TPE) data kits and dashboards, promotion-measure export to Data Cloud, optional custom KPI measures, and supported Consumer Goods sync configuration and assignments.",
+  "author": {
+    "name": "Salesforce"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "Consumer Goods Cloud",
+    "Consumer Goods TPM",
+    "Trade Promotion Management",
+    "TPM liability accruals",
+    "TPM accrual data kit",
+    "TPM accrual Lightning component setup",
+    "Trade Promotion Effectiveness",
+    "TPE data kit",
+    "TPE dashboards",
+    "TPE custom KPI measures",
+    "promotion measure export",
+    "RTR Data Cloud export",
+    "CG Cloud sync management",
+    "sync configuration and assignment"
+  ],
+  "dependencies": [],
+  "skills": "./skills/"
+}

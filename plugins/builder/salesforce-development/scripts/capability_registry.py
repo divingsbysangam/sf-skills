@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Channel-aware Salesforce capability registry primitives.
 
-This module hashes skill trees and reads the bounded name/description subset
-from SKILL.md frontmatter. Generic, dependency-free primitives consumed both
-at end-user runtime (``plugin_catalog.py``, for the plugin-catalog gap
-detector) and at release-verification time (``verify-public-plugin-release.py``).
-It never serializes internal authoring inventory.
+This module hashes skill trees and provides bounded file-reading primitives.
+Generic, dependency-free primitives consumed both at end-user runtime
+(``plugin_catalog.py``, for the plugin-catalog gap detector) and at
+release-verification time (``verify-public-plugin-release.py``). SKILL.md
+frontmatter reading is release-time only and lives in
+``scripts/release-ci/public-manifest.mjs``. It never serializes internal
+authoring inventory.
 
 Canonical tree hash policy (``sf-skill-tree-v1``): entries use sorted POSIX
 relative paths. Directories, regular files, and symbolic links have distinct
@@ -25,7 +27,6 @@ import os
 import re
 import stat
 import sys
-import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -51,19 +52,6 @@ TREE_SCAN_DIR_FD_SUPPORTED = (
     and os.open in getattr(os, "supports_dir_fd", set())
 )
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-
-# Description upper bound; headless-only skills are exempt (see read_skill_bytes).
-DESCRIPTION_MAX = 1024
-DISTRIBUTION_CHANNEL_HEADLESS = "headless360Mcp"
-DISTRIBUTION_CHANNEL_SF_SKILLS = "sf-skills"
-
-# TODO: this carve-out is duplicated in public-manifest.mjs and validate-skills.ts,
-# which must agree forever. Consolidate (readers shell out here, like --hash-skills) or
-# add a cross-reader conformance test.
-_HEADLESS_CHANNEL_RE = re.compile(r"(?:^|[{,\s\"'])headless360Mcp[\"']?\s*:")
-_SF_SKILLS_CHANNEL_RE = re.compile(r"(?:^|[{,\s\"'])sf-skills[\"']?\s*:")
-_DISTRIBUTION_KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*:(.*)$")
-_BLOCK_SCALAR_INDICATORS = (">", ">-", ">+", "|", "|-", "|+")
 
 
 class RegistryError(ValueError):
@@ -399,176 +387,6 @@ def canonical_tree_sha256(
     if not observation["stable"]:
         raise RegistryError(f"{root}: tree changed during scan")
     return observation["treeSha256"]
-
-
-def _has_control(value: str) -> bool:
-    return any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in value)
-
-
-def _frontmatter_bytes(content: bytes, path: Path) -> list[str]:
-    try:
-        lines = content.decode("utf-8").splitlines()
-    except UnicodeError as exc:
-        raise RegistryError(f"{path}: cannot read SKILL.md: {exc}") from exc
-    if not lines or lines[0].strip() != "---":
-        raise RegistryError(f"{path}: missing opening frontmatter delimiter")
-    try:
-        end = next(index for index in range(1, len(lines)) if lines[index].strip() == "---")
-    except StopIteration as exc:
-        raise RegistryError(f"{path}: missing closing frontmatter delimiter") from exc
-    return lines[1:end]
-
-
-def _block_scalar(lines: list[str], start: int, style: str, path: Path) -> str:
-    values: list[Optional[str]] = []
-    for line in lines[start + 1:]:
-        if line and not line[0].isspace():
-            break
-        if not line.strip():
-            values.append(None)
-        else:
-            match = re.match(r"^(\s+)(.*)$", line)
-            if not match:
-                raise RegistryError(f"{path}: malformed description block")
-            values.append(match.group(2))
-    if not values or not any(value is not None for value in values):
-        raise RegistryError(f"{path}: description block is empty")
-    if style.startswith("|"):
-        text = "\n".join("" if value is None else value for value in values)
-    else:
-        paragraphs: list[str] = []
-        current: list[str] = []
-        for value in values:
-            if value is None:
-                if current:
-                    paragraphs.append(" ".join(current))
-                    current = []
-            else:
-                current.append(value)
-        if current:
-            paragraphs.append(" ".join(current))
-        text = "\n".join(paragraphs)
-    return text + "\n" if style.endswith("+") or style in (">", "|") else text
-
-
-def _strip_yaml_comment(text: str) -> str:
-    """Drop a trailing YAML `#` comment so a channel named in a comment can't match."""
-    return re.sub(r"(^|\s)#.*$", r"\1", text)
-
-
-def _scan_channels(text: str, channels: set[str]) -> None:
-    """Record any channel key in one YAML line. Anchored to line start or a flow
-    delimiter so a bare substring can't false-match. Mirrors public-manifest.mjs.
-    """
-    src = _strip_yaml_comment(text)
-    if _HEADLESS_CHANNEL_RE.search(src):
-        channels.add(DISTRIBUTION_CHANNEL_HEADLESS)
-    if _SF_SKILLS_CHANNEL_RE.search(src):
-        channels.add(DISTRIBUTION_CHANNEL_SF_SKILLS)
-
-
-def _distribution_channels(lines: list[str]) -> set[str]:
-    """Channels under `metadata.distribution`, scoped to that block so a same-named
-    key elsewhere can't spoof it. A top-level block-scalar `description:` body is
-    skipped so its prose can't inject a phantom channel. Mirrors public-manifest.mjs.
-    """
-    channels: set[str] = set()
-    block_indent: Optional[int] = None  # indent of `distribution:` inside its block; None outside
-    index = 0
-    total = len(lines)
-    while index < total:
-        line = lines[index]
-        index += 1
-        if not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip(" \t"))
-        if block_indent is not None and indent <= block_indent:
-            block_indent = None  # dedented out
-        if block_indent is not None:
-            _scan_channels(line, channels)  # any line still inside the distribution block
-            continue
-        match = _DISTRIBUTION_KEY_RE.match(line)
-        if not match:
-            continue
-        key = match.group(1)
-        # Skip a top-level block-scalar description body (indented like real keys).
-        if key == "description" and indent == 0 and match.group(2).strip() in _BLOCK_SCALAR_INDICATORS:
-            while index < total and (not lines[index].strip() or lines[index][0].isspace()):
-                index += 1
-            continue
-        if key == "distribution":
-            inline = _strip_yaml_comment(match.group(2)).strip()
-            if inline:
-                _scan_channels(inline, channels)  # same-line flow form
-            else:
-                block_indent = indent  # block or child-line flow form follows
-    return channels
-
-
-def read_skill_bytes(content: bytes, path: Path) -> dict[str, str]:
-    """Parse the bounded name and description subset from captured SKILL.md bytes."""
-    lines = _frontmatter_bytes(content, path)
-    fields: dict[str, str] = {}
-    for index, line in enumerate(lines):
-        if not line or line[0].isspace() or ":" not in line:
-            continue
-        key, raw = line.split(":", 1)
-        if key not in ("name", "description"):
-            continue
-        value = raw.strip()
-        if key == "description" and value in (">", ">-", ">+", "|", "|-", "|+"):
-            fields[key] = _block_scalar(lines, index, value, path)
-        elif value.startswith('"'):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise RegistryError(f"{path}: invalid double-quoted {key}: {exc.msg}") from exc
-            if type(parsed) is not str:
-                raise RegistryError(f"{path}: {key} must be a string")
-            fields[key] = parsed
-        elif key == "name" and NAME_PATTERN.fullmatch(value):
-            fields[key] = value
-        else:
-            raise RegistryError(f"{path}: unsupported {key} scalar")
-    if set(fields) != {"name", "description"}:
-        raise RegistryError(f"{path}: missing required name or description")
-    if fields["name"] != path.parent.name:
-        raise RegistryError(f"{path}: frontmatter name does not match directory")
-    # Headless-only skills may exceed DESCRIPTION_MAX; the cap stays hard for sf-skills.
-    channels = _distribution_channels(lines)
-    headless_only = (
-        DISTRIBUTION_CHANNEL_HEADLESS in channels
-        and DISTRIBUTION_CHANNEL_SF_SKILLS not in channels
-    )
-    description_over_cap = len(fields["description"]) > DESCRIPTION_MAX and not headless_only
-    if len(fields["name"]) > 64 or len(fields["description"]) < 1 or description_over_cap:
-        raise RegistryError(f"{path}: name or description is outside supported bounds")
-    if _has_control(fields["name"]) or _has_control(fields["description"]):
-        raise RegistryError(f"{path}: name or description contains control characters")
-    return fields
-
-
-def read_skill(path: Path) -> dict[str, str]:
-    """Read the bounded name and description subset from SKILL.md frontmatter."""
-    return read_skill_bytes(read_regular_file_bytes(path), path)
-
-
-def skill_directories(root: Path) -> dict[str, Path]:
-    """Return strict one-level skill directories keyed by validated name."""
-    if not root.is_dir():
-        raise RegistryError(f"{root}: skills directory is missing")
-    result: dict[str, Path] = {}
-    for entry in sorted(root.iterdir(), key=lambda item: item.name):
-        if not entry.is_dir() or entry.is_symlink():
-            raise RegistryError(f"{entry}: skills inventory must contain only real directories")
-        if not NAME_PATTERN.fullmatch(entry.name):
-            raise RegistryError(f"{entry}: invalid skill directory name")
-        skill_file = entry / "SKILL.md"
-        record = read_skill(skill_file)
-        if record["name"] != entry.name:
-            raise RegistryError(f"{skill_file}: inventory name mismatch")
-        result[entry.name] = entry
-    return result
 
 
 def _valid_hash(value) -> bool:

@@ -7,6 +7,12 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-30
+
+### Changed
+
+- Updated skills: `experience-ui-bundle-2gp-deploy`, `experience-ui-bundle-features-generate`, `experience-ui-bundle-mfa-configure`, `experience-ui-bundle-project-generate`.
+
 ## [0.2.1] — 2026-10-02
 
 ### Changed

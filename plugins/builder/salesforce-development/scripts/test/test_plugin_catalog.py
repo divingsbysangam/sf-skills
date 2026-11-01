@@ -18,6 +18,111 @@ MODULE_PATH = SCRIPTS / "plugin_catalog.py"
 REPO_ROOT = SCRIPTS.parents[3]
 PLUGIN_ROOT = SCRIPTS.parent
 
+# dx-packaging is pre-release: it is held on develop but has not been promoted to
+# main. The two real-repo tests below assert that hold, so they only apply to a
+# tree whose marketplace actually lists the plugin; they re-enable on their own
+# once dx-packaging is promoted.
+_MARKETPLACE = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+HAS_DX_PACKAGING = _MARKETPLACE.is_file() and '"name": "dx-packaging"' in _MARKETPLACE.read_text(encoding="utf-8")
+SKIP_NO_DX_PACKAGING = "dx-packaging is not in this tree's marketplace (pre-release, held on develop only)"
+
+
+class GroupedAnchorCompanionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module(MODULE_PATH, "grouped_companions_catalog")
+
+    def test_groups_require_every_token_and_legacy_alternatives_stay_or(self):
+        rule = ['itsm', ['it', 'service']]
+        for terms, expected in [
+            ({'itsm'}, True), ({'it', 'service'}, True),
+            ({'it'}, False), ({'service'}, False), ({'employee', 'service'}, False),
+        ]:
+            with self.subTest(terms=terms):
+                self.assertEqual(expected, self.mod._anchor_companions_match(rule, sorted(terms)))
+        for terms in [set(), {'it'}, {'service'}, {'it', 'service'}]:
+            self.assertEqual(bool(terms & {'it', 'service'}),
+                             self.mod._anchor_companions_match(['it', 'service'], sorted(terms)))
+
+    def test_phrases_require_adjacent_tokens_and_groups_require_capability(self):
+        rule = ['itsm', ['it service', 'agent']]
+        for prompt, expected in [
+            ('Configure IT-Service employee agent', True),
+            ('Configure ITSM agents', True),
+            ('Set up a service agent in Agentforce and test it', False),
+            ('Configure employee records for IT Service', False),
+            ('Configure IT employee agent service', False),
+            ('Configure audit service agent', False),
+            ('Configure it. Service agent', False),
+            ('Configure it; service agent', False),
+            ('Configure it! Service agent', False),
+            ('Configure it? Service agent', False),
+            ('Configure IT / Service agent', False),
+            ('Configure IT \n Service agent', True),
+        ]:
+            with self.subTest(prompt=prompt):
+                raw, segments = self.mod._companion_prompt_evidence(prompt)
+                self.assertEqual(expected, self.mod._anchor_companions_match(rule, raw, segments))
+
+    def test_malformed_groups_fail_authoring_and_runtime_loading(self):
+        bad_values = [None, {}, [], {'example': []}, {'missing': ['it']},
+                      {'example': [None]}, {'example': [['it']]},
+                      {'example': [[]]}, {'example': [['it', 'it']]},
+                      {'example': [['it', ['service', 'agent']]]},
+                      {'example': [['it', 1]]}, {'example': [['it', 'Service']]},
+                      {'example': [['it', 'two  words']]}, {'example': [' it service']},
+                      {'example': ['it service ']}, {'example': ['it\tservice']},
+                      {'example': ['it-service']}, {'example': ['it service', 'it service']}, {'example': ['it', 'it']},
+                      {'example': [['it', 'service'], ['service', 'it']]}]
+        for bad in bad_values:
+            with self.subTest(value=bad), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / '.claude-plugin').mkdir()
+                (root / 'catalog').mkdir()
+                (root / 'config.yml').write_text('internalPlugins: []')
+                match = {'examplePrompts': ['Create an example'], 'anchorTerms': ['example'],
+                         'anchorCompanions': bad}
+                entry = {'name': 'example', 'source': './plugins/example',
+                         'description': 'Example capability', 'keywords': ['example'],
+                         'metadata': {'match': match}}
+                (root / '.claude-plugin/marketplace.json').write_text(
+                    json.dumps({'name': 'example', 'plugins': [entry]}))
+                with self.assertRaisesRegex(self.mod.PluginCatalogError, 'anchorCompanions'):
+                    self.mod.build_catalog(root, root)
+                data = self.mod.build_catalog(REPO_ROOT, PLUGIN_ROOT)
+                data['plugins'][0]['match']['anchorTerms'] = ['example']
+                data['plugins'][0]['match']['anchorCompanions'] = bad
+                (root / 'catalog/plugins.json').write_text(json.dumps(data))
+                with self.assertRaisesRegex(self.mod.PluginCatalogError, 'anchorCompanions'):
+                    self.mod.load_catalog(root)
+
+    def test_existing_string_rules_keep_every_plugin_score_and_eligibility(self):
+        from unittest.mock import patch
+        data = self.mod.build_catalog(REPO_ROOT, PLUGIN_ROOT)
+        # Compare a valid legacy catalog with the old single-token predicate.
+        # Phrase/group entries are covered by the grammar and evidence regressions;
+        # the old evaluator cannot represent them. Select the corpus once, using
+        # grammar rather than plugin identities, then compare every result below.
+        def legacy_row(row):
+            return all(isinstance(choice, str) and len(choice.split()) == 1
+                       for choices in row['match'].get('anchorCompanions', {}).values()
+                       for choice in choices)
+
+        self.assertTrue(legacy_row({'match': {'anchorCompanions': {'a': ['token']}}}))
+        self.assertFalse(legacy_row({'match': {'anchorCompanions': {'a': ['two words']}}}))
+        self.assertFalse(legacy_row({'match': {'anchorCompanions': {'a': [['one', 'two']]}}}))
+        data['plugins'] = [row for row in data['plugins'] if legacy_row(row)]
+        prompts = [prompt for row in data['plugins'] for prompt in row['match']['examplePrompts']]
+        prompts += ['Test my Agentforce agent and fix it', 'Drive adoption', 'Set up Salesforce test drive']
+        for prompt in prompts:
+            for anchors in (True, False):
+                with self.subTest(prompt=prompt, anchors=anchors):
+                    actual = self.mod.score_prompt_against_catalog(prompt, data, require_anchor_terms=anchors)
+                    with patch.object(self.mod, '_anchor_companions_match',
+                                      side_effect=lambda choices, terms, segments=None: not set(terms).isdisjoint(choices)):
+                        legacy = self.mod.score_prompt_against_catalog(prompt, data, require_anchor_terms=anchors)
+                    self.assertEqual(legacy, actual)
+
 
 class PluginCatalogGenerationTests(unittest.TestCase):
     @classmethod
@@ -240,6 +345,13 @@ class InternalPluginHoldsTests(unittest.TestCase):
             with self.assertRaisesRegex(self.mod.PluginCatalogError, "invalid internalPlugins"):
                 self.mod.read_internal_plugin_holds(config)
 
+    @unittest.skipUnless(HAS_DX_PACKAGING, SKIP_NO_DX_PACKAGING)
+    def test_real_config_yml_holds_pre_release_packaging_plugin(self):
+        self.assertEqual(
+            self.mod.read_internal_plugin_holds(REPO_ROOT / "config.yml"),
+            {"dx-packaging"},
+        )
+
 
 class BuildCatalogTests(unittest.TestCase):
     """Synthetic, tiny marketplaces — the real salesforce-development marketplace
@@ -395,6 +507,12 @@ class HeldPluginDescriptionsTests(unittest.TestCase):
             (repo_root / ".claude-plugin" / "marketplace.json").write_text("not json", encoding="utf-8")
             with self.assertRaisesRegex(self.mod.PluginCatalogError, "cannot load marketplace manifest"):
                 self.mod.held_plugin_descriptions(repo_root, repo_root)
+
+    @unittest.skipUnless(HAS_DX_PACKAGING, SKIP_NO_DX_PACKAGING)
+    def test_real_repo_protects_held_packaging_plugin_description(self):
+        descriptions = self.mod.held_plugin_descriptions(REPO_ROOT, PLUGIN_ROOT)
+        self.assertEqual(set(descriptions), {"dx-packaging"})
+        self.assertIn("push upgrades", descriptions["dx-packaging"])
 
 
 class ScorePromptAgainstCatalogTests(unittest.TestCase):

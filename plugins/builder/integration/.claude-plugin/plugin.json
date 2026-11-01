@@ -1,7 +1,7 @@
 {
   "name": "integration",
   "displayName": "Salesforce Integration",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Build Salesforce integrations and event-driven flows: generate connectivity (Named Credentials, External Services, REST/SOAP callouts), generate a custom Salesforce Connect adapter for external-object access, configure a Connected App or External Client App for secure OAuth integration, configure Change Data Capture, and configure platform event subscriptions. Use when integrating external systems or wiring event-driven architecture — connectivity, Salesforce Connect adapters, connected apps and OAuth, CDC, or platform event subscription configuration.",
   "author": { "name": "Salesforce" },
   "license": "Apache-2.0",

@@ -7,6 +7,72 @@ and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-10-30
+
+### Added
+
+- Add the `platform-metadata-discovery-get` and `platform-metadata-grounding-get` skills, which
+  find existing org metadata before you create or write code against it: discovery routes each
+  question to the right tool, and grounding finds metadata by meaning through the Metadata
+  Grounding MCP.
+- Add optional Headless 360 support in Claude Code, Codex CLI, and Codex desktop for live
+  Salesforce Setup workflows. It defaults off and requires explicit approval for writes.
+- Add Headless 360 setup and readiness guidance, including saved Codex enablement and
+  clear network-policy diagnostics.
+- Add Consumer Goods companion-plugin recommendations for TPM accruals, TPE analytics,
+  Data Cloud exports, and sync setup.
+
+- Add `service-itsm` to companion-plugin recommendations for initial Agentforce for IT Service
+  setup: enable and validate Studio, configure Employee and Fulfiller agents, assign ITSM
+  permissions, and grant agent runtime access.
+- Support phrase and grouped matching rules to keep IT Service recommendations relevant.
+- Plugin recommendation sensitivity can be set for one project with `--project` (for example
+  `/salesforce-development:plugin-recommendations --project set low`). The saved setting is shared
+  by every agent you use, stored under `~/.sf/`, and `status` shows which setting is in effect.
+- Add the `salesforce-metadata-grounding` MCP server (Claude Code and Codex) so the metadata
+  discovery and grounding skills can find metadata by meaning through Salesforce Catalog. The
+  server is used only in orgs where Catalog is provisioned. `status` and setup report it as an
+  optional row that warns when it is not connected. That warning never blocks a build.
+
+### Changed
+
+- Updated skills: `platform-apex-generate`, `platform-apex-test-generate`, `platform-metadata-deploy`, `platform-report-generate`, `platform-value-set-generate`.
+
+### Fixed
+
+- Demo orgs on the demo partition (`*.demo.my.salesforce.com`) are now classified as trial
+  orgs, not production, so deploys to them no longer need the production confirmation and
+  destructive changes to them are no longer blocked.
+  ([sf-skills#397](https://github.com/forcedotcom/sf-skills/issues/397), reported by
+  [@seb-schi](https://github.com/seb-schi))
+- Preserve saved plugin recommendation preferences when the file cannot be read or multiple
+  sessions update it at once.
+- Treat conflicting agent selectors as unknown install state and recognize Codex session markers
+  in telemetry. Reduce repeated preference reads and host path checks.
+- Explain when saved plugin preferences reach their size limit and support explicit cleanup of
+  settings for project folders that no longer exist with `plugin-recommendations prune`.
+- Codex no longer treats plugins enabled only in Claude Code as installed, so they are recommended
+  again. The host is inferred from Codex markers when it is not stated, and when it is unclear the
+  plugin keeps recommending rather than going quiet; `plugin-install` then refuses to run and
+  prints manual install commands for both Claude Code and Codex, as it also does when `--client`
+  and `SF_AGENT_CLIENT` name different agents. An explicit Codex selector under
+  conflicting markers still works but now asks for your confirmation instead of installing
+  immediately. `plugin-recommendations on
+  --project` with no saved project setting is now a no-op instead of reporting a reset. (W-24599110)
+- In Codex, changing plugin recommendation sensitivity now asks for sandbox escalation, because the
+  shared setting lives under `~/.sf`, outside the workspace sandbox. If a save is still blocked, the
+  error names the Codex sandbox and the escalation to request instead of saying "try again in a
+  moment". (W-24599110)
+
+### Removed
+
+- The `salesforce-api-context` MCP server connection (Claude Code and Codex). The plugin now ships
+  `salesforce-metadata-experts`, `salesforce-headless-360`, and `salesforce-lsp`. Readiness and
+  `check-tools` no longer probe it, and the banner MCP line lists only `metadata-experts`. (W-24682279)
+- The plugin-only `platform-deploy-validate` and `platform-quick-deploy` skills. Production deploys now
+  go through the validate → quick-deploy path in `platform-metadata-deploy`; the deploy gate, failure
+  advisories, and agent guidance point there.
+
 ## [2.5.0] — 2026-10-16
 
 ### Added

@@ -43,6 +43,12 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from _test_support import isolate_host_markers
+
+
+def setUpModule():
+    isolate_host_markers()
+
 # sf_telemetry.py is the sibling of this test's parent dir: scripts/test/ -> scripts/.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 _MODULE_PATH = _SCRIPTS_DIR / "sf_telemetry.py"
@@ -497,7 +503,7 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
         self.assertEqual(ev["payload"], {"mcp_server": "salesforce-lsp",
                                          "mcp_tool": "apex_diagnostics", "outcome": "success"})
         self.capture("mcp_tool_used", "failure",
-                     payload={"session_id": "S1", "tool_name": "mcp__salesforce-api-context__query"})
+                     payload={"session_id": "S1", "tool_name": "mcp__salesforce-metadata-experts__query"})
         self.assertEqual(self.last("mcp_tool_used")["payload"]["outcome"], "failure")
 
     def test_mcp_unknown_server_emits_nothing(self):
@@ -899,6 +905,9 @@ class EveryEventCapturedTests(TelemetryCaptureTestBase):
         for record in self.events():
             self.assertNoLeak(sft._to_pdp_event(record))
             self.assertNoLeak(sft._to_a4d_event(record))
+
+    def test_plugin_install_result_vocabulary_includes_host_unclear(self):
+        self.assertIn("host_unclear", sft._PLUGIN_INSTALL_REASONS)
 
     def test_plugin_install_result_accepts_only_closed_vocabulary(self):
         with mock.patch.object(
@@ -2338,7 +2347,7 @@ class PdpMappingTests(TelemetryCaptureTestBase):
             "skill_dispatched": {"skill": "platform-apex-generate", "skill_domain": "platform"},
             "agent_dispatched": {"agent_type": "code-review"},
             "exception": {"error_class": "rate_limit", "kind": "api_error"},
-            "mcp_tool_used": {"mcp_server": "api-context", "mcp_tool": "query", "outcome": "success"},
+            "mcp_tool_used": {"mcp_server": "metadata-experts", "mcp_tool": "query", "outcome": "success"},
             "plugin_loaded": {"plugin": "agentforce-adlc", "origin": "external",
                               "confidence": "high", "surface": "bypass-gate"},
             "plugin_suggestion_declined": {"plugin": "agentforce-adlc", "origin": "external",
@@ -2362,7 +2371,7 @@ class PdpMappingTests(TelemetryCaptureTestBase):
         self.assertEqual(produced["skill_dispatched"]["contextValue"], "platform")
         self.assertEqual(produced["command_invoked"]["componentId"], "sf-context.status-org")
         self.assertEqual(produced["session_end"]["eventVolume"], 7)
-        self.assertEqual(produced["mcp_tool_used"]["componentId"], "api-context.query")
+        self.assertEqual(produced["mcp_tool_used"]["componentId"], "metadata-experts.query")
         self.assertEqual(produced["exception"]["componentId"], "rate_limit")
         self.assertEqual(produced["plugin_loaded"]["eventName"], "plugin.loaded")
         self.assertEqual(produced["plugin_loaded"]["componentId"], "agentforce-adlc")
@@ -2524,6 +2533,20 @@ class AgentHarnessDetectionTests(unittest.TestCase):
 
     def test_codex(self):
         self.assertEqual(self._harness({"CODEX_HOME": "/x/.codex"}), "codex")
+
+    def test_codex_session_markers_without_codex_home(self):
+        for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+            with self.subTest(marker=key):
+                self.assertEqual(self._harness({key: "thread-1"}), "codex")
+                self.assertEqual(self._harness({key: "  "}), "other")
+                self.assertEqual(self._harness({key: "thread-1", "CURSOR_AGENT": "1"}), "codex")
+
+    def test_explicit_host_and_claude_session_marker_precedence(self):
+        self.assertEqual(self._harness({"SF_AGENT_CLIENT": " CoDeX ", "CLAUDECODE": "1"}), "codex")
+        self.assertEqual(self._harness({"SF_AGENT_CLIENT": "claude", "CODEX_THREAD_ID": "t"}),
+                         "claude-code")
+        self.assertEqual(self._harness({"CLAUDE_CODE_SESSION_ID": "s"}), "claude-code")
+        self.assertEqual(self._harness({"CLAUDECODE": "1", "CODEX_THREAD_ID": "t"}), "claude-code")
 
     def test_copilot_cli_via_home(self):
         self.assertEqual(self._harness({"COPILOT_HOME": "/x/.copilot"}), "copilot-cli")
@@ -2921,7 +2944,7 @@ class GoldenWireShapeTests(unittest.TestCase):
         "skill_dispatched": {"skill": "platform-apex-generate", "skill_domain": "platform"},
         "agent_dispatched": {"agent_type": "code-review"},
         "exception": {"error_class": "rate_limit", "kind": "api_error"},
-        "mcp_tool_used": {"mcp_server": "api-context", "mcp_tool": "query", "outcome": "success"},
+        "mcp_tool_used": {"mcp_server": "metadata-experts", "mcp_tool": "query", "outcome": "success"},
         # The four plugin funnel events. Each match reason is already curated
         # vocabulary in the shipped catalog/plugins.json (the UIP projection
         # re-clamps it against that catalog), so the goldens pin the exact
@@ -2979,7 +3002,7 @@ class GoldenWireShapeTests(unittest.TestCase):
                 "componentId": "rate_limit", "contextName": "kind", "contextValue": "api_error"},
             "mcp_tool_used": {
                 "productFeatureId": self.PFID, "eventName": "mcpTool.used",
-                "componentId": "api-context.query",
+                "componentId": "metadata-experts.query",
                 "contextName": "outcome", "contextValue": "success"},
             # The match reason never rides PDP: the fixed 3-part tuple only.
             "plugin_recommended": {
@@ -3051,7 +3074,7 @@ class GoldenWireShapeTests(unittest.TestCase):
             "exception": {"eventName": "exception.raised", "attributes":
                 self._uip_common("rate_limit", "kind", "api_error")},
             "mcp_tool_used": {"eventName": "mcpTool.used", "attributes":
-                self._uip_common("api-context.query", "outcome", "success")},
+                self._uip_common("metadata-experts.query", "outcome", "success")},
             "plugin_recommended": {"eventName": "plugin.recommended", "attributes": {
                 **self._uip_common("experience-lwc", "origin::confidence::surface",
                                    "local::high::user-prompt"),

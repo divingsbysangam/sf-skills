@@ -39,6 +39,30 @@ gates. Existing runtime environment controls, including `SFDX_LSP_DEPLOY_GATE` a
 opt-outs (`DO_NOT_TRACK=true` or `SF_DISABLE_TELEMETRY=true`), remain available. Do not assume
 that a setting accepted by Claude’s configuration UI is transported by Codex.
 
+### Plugin recommendation sensitivity in Codex
+
+Codex has no install-time plugin options, so the Claude "Plugin recommendation" install choice has
+no Codex equivalent. Choose one of these instead:
+
+- Set `SF_PLUGIN_MATCH_SENSITIVITY=off|low|standard|high|<1.0-10.0>` in the environment you
+  launch the Codex CLI from. Codex passes its process environment to plugin hooks, so the setting
+  applies to recommendations. This variable takes precedence over saved preferences. An invalid
+  value is silently ignored: the plugin falls back to the next source, with no warning.
+- Or save a preference with the plugin-recommendations command, for example
+  `plugin-recommendations --project set high`. Saved preferences live under `~/.sf/` and apply in
+  Claude Code and Codex alike.
+
+In Codex, `plugin-recommendations` `set`, `on`, `off`, and `prune` write `~/.sf` outside the
+workspace sandbox, so the Codex sandbox may block the write. If it does, the command asks you to
+re-run it with escalation, and Codex asks you to approve that run. `status` only reads.
+
+The plugin treats a session as Codex when `SF_AGENT_CLIENT=codex` is set. Otherwise it infers the
+host: Codex session markers (`CODEX_THREAD_ID`, `CODEX_SESSION_ID`, or the plugin installed under
+Codex's plugin cache) mean Codex, unless Claude markers are also present (then the host is
+unclear). With no Codex or Claude marker, a set `CODEX_HOME` means Codex. `SF_AGENT_CLIENT=claude`
+together with a Codex marker also leaves the host unclear. With no Codex or Claude signal at
+all, the host defaults to Claude.
+
 Packaged canonical skills remain authoritative. Resolve their package-relative commands
 against the owning installed plugin and supply `SF_AGENT_CLIENT=codex` on Salesforce
 Development runtime calls; a hook cannot export that environment into later shell tools.
